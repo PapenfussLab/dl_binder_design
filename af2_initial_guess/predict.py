@@ -165,61 +165,107 @@ class AF2_runner():
 
         return feature_dict, initial_guess 
 
+    def calculate_rmsd_target(self, feat_holder) -> float:
+        """
+        Calculate RMSD of the target chain CA atoms aligned on themselves.
+        Returns nan for monomers since there's no target chain.
+        """
+        if feat_holder.monomer or feat_holder.binderlen < 0:
+            return float('nan')
+        
+        # Get initial and predicted CA coordinates
+        init_ca = feat_holder.initial_all_atom_positions[:, 1, :]  # CA atoms from initial
+        
+        try:
+            # Extract predicted CA coordinates from Rosetta pose
+            pred_ca = np.array([feat_holder.outpose.residue(i+1).atom('CA').xyz() 
+                            for i in range(feat_holder.outpose.size())])
+        except Exception as e:
+            print(f"Warning: Could not extract predicted CA coordinates for {feat_holder.tag}: {e}")
+            return float('nan')
+        
+        # Target residue indices (from binderlen onwards)
+        target_indices = np.arange(feat_holder.binderlen, len(feat_holder.seq))
+        
+        # Calculate target RMSD (target aligned on target)
+        rmsd_target = af2_util.subset_rmsd(
+            xyz1=init_ca,
+            align1=target_indices,  # Align on target residues
+            calc1=target_indices,   # Calculate over target residues
+            xyz2=pred_ca,
+            align2=target_indices,  # Align on target residues
+            calc2=target_indices    # Calculate over target residues
+        )
+        
+        return rmsd_target
+
     def generate_scoredict(self, feat_holder, confidences, rmsds) -> None:
-        '''
-        Collect the confidence values, slicing them to the binder and target regions
-        then add the parsed scores to the score_dict
-        '''
-
+        """
+        Collect the confidence values and calculate scores based on monomer vs binder design
+        """
         binderlen = feat_holder.binderlen
-
         plddt_array = confidences['plddt']
-        plddt = np.mean( plddt_array )
-
-        if feat_holder.monomer:
-            plddt_binder = np.mean( plddt_array )
-            plddt_target = float('nan')
-        else:
-            plddt_binder = np.mean( plddt_array[:binderlen] )
-            plddt_target = np.mean( plddt_array[binderlen:] )
-
+        plddt_overall = np.mean(plddt_array)
         pae = confidences['predicted_aligned_error']
 
+        # Calculate rmsd_overall as CA RMSD over all residues
+        # Need to get predicted CA coordinates from the pose
+        predicted_ca = np.array([feat_holder.outpose.residue(i+1).atom('CA').xyz() 
+                                for i in range(feat_holder.outpose.size())])
+        
+        rmsd_overall = af2_util.subset_rmsd(
+            xyz1=feat_holder.initial_all_atom_positions[:, 1, :],  # CA atoms from initial
+            align1=np.arange(len(plddt_array)),                    # Align on all residues
+            calc1=np.arange(len(plddt_array)),                     # Calculate over all residues
+            xyz2=predicted_ca,                                     # Predicted CA coordinates
+            align2=np.arange(len(plddt_array)),                    # Align on all residues
+            calc2=np.arange(len(plddt_array))                      # Calculate over all residues
+        )
+
         if feat_holder.monomer:
-            pae_binder = np.mean( pae )
-            pae_target = float('nan')
-            pae_interaction_total = float('nan')
+            # Monomer scoring: only overall metrics
+            score_dict = {
+                "plddt_overall": plddt_overall,
+                "pae_overall": np.mean(pae),
+                "rmsd_overall": rmsd_overall,
+                "time": timer() - self.t0
+            }
         else:
-            pae_interaction1 = np.mean( pae[:binderlen,binderlen:] )
-            pae_interaction2 = np.mean( pae[binderlen:,:binderlen] )
-            pae_binder = np.mean( pae[:binderlen,:binderlen] )
-            pae_target = np.mean( pae[binderlen:,binderlen:] )
-            pae_interaction_total = ( pae_interaction1 + pae_interaction2 ) / 2
+            # Calculate rmsd_target
+            rmsd_target = self.calculate_rmsd_target(feat_holder)
+            # Binder scoring: detailed breakdown
+            plddt_binder = np.mean(plddt_array[:binderlen])
+            plddt_target = np.mean(plddt_array[binderlen:])
 
-        time = timer() - self.t0
+            pae_overall = np.mean(pae)
+            pae_binder = np.mean(pae[:binderlen, :binderlen])
+            pae_target = np.mean(pae[binderlen:, binderlen:])
+            
+            # Calculate interaction PAE (binder-target interface)
+            pae_interaction1 = np.mean(pae[:binderlen, binderlen:])
+            pae_interaction2 = np.mean(pae[binderlen:, :binderlen])
+            pae_interaction = (pae_interaction1 + pae_interaction2) / 2
 
-        score_dict = {
-                "plddt_total" : plddt,
-                "plddt_binder" : plddt_binder,
-                "plddt_target" : plddt_target,
-                "pae_binder" : pae_binder,
-                "pae_target" : pae_target,
-                "pae_interaction" : pae_interaction_total,
-                "binder_aligned_rmsd": rmsds['binder_aligned_rmsd'],
-                "target_aligned_rmsd": rmsds['target_aligned_rmsd'],
-                "time" : time
-        }
+            score_dict = {
+                "plddt_overall": plddt_overall,
+                "plddt_binder": plddt_binder,
+                "plddt_target": plddt_target,
+                "pae_overall": pae_overall,
+                "pae_binder": pae_binder,
+                "pae_target": pae_target,
+                "pae_interaction": pae_interaction,
+                "rmsd_overall": rmsd_overall,
+                "rmsd_binder_bndaln": rmsds['binder_aligned_rmsd'],
+                "rmsd_binder_tgtaln": rmsds['target_aligned_rmsd'],
+                "rmsd_target": rmsd_target,
+                "time": timer() - self.t0
+            }
 
-        # Store this in the feature holder for later use
+        # Store scores and output
         feat_holder.score_dict = score_dict
-
-        # If we ever want to write strings to the score file we can do it here
-        string_dict = None
-
-        self.struct_manager.record_scores(feat_holder.outtag, score_dict, string_dict)
-
-        print(score_dict)
-        print(f"Tag: {feat_holder.outtag} reported success in {time} seconds")
+        self.struct_manager.record_scores(feat_holder.outtag, score_dict, None)
+        
+        print(f"Tag: {feat_holder.outtag} scores: {score_dict}\n")
 
     def process_output(self, feat_holder, feature_dict, prediction_result) -> None:
         '''
