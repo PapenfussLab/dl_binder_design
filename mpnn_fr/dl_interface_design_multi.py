@@ -116,7 +116,7 @@ class sample_features():
             }
         else:
             self.fixed_res = {
-                self.chains: fixed_list,
+                self.chains[0]: fixed_list,
                 self.chains[1]: []
             }
 
