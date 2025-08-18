@@ -58,7 +58,7 @@ parser.add_argument( "-output_intermediates", action="store_true", help='Whether
 parser.add_argument( "-seqs_per_struct", type=int, default="1", help="The number of sequences to generate for each input structure (default: 1)" )
 # New relaxation parameters
 parser.add_argument( "-relax_output", action="store_true", default=False, help='Whether to run relaxation before saving output. (default: False)')
-parser.add_argument( "-relax_seqs_per_cycle", type=int, default=5, help="Number of intermediate sequences to generate per relax cycle. The sequence with the lowest (best) score is kept (default: 5)")
+parser.add_argument( "-relax_seqs_per_cycle", type=int, default=1, help="Number of intermediate sequences to generate per relax cycle. The sequence with the lowest (best) score is kept (default: 1)")
 parser.add_argument( "-relax_convergence_rmsd", type=float, default=0.2, help="Convergence criteria 1 of 2. Design is considered converged if the C-alpha RMSD (Å) between cycles is <= this threshold (default: 0.2)")
 parser.add_argument( "-relax_convergence_score", type=float, default=0.1, help="Convergence criteria 2 of 2. Design is considered converged if the improvement in score between cycles is <= this threshold (default: 0.1)")
 parser.add_argument( "-relax_convergence_max_cycles", type=int, default=1, help="Design is considered converged if it meets both convergence criteria for n consecutive cycles (default: 1)")
