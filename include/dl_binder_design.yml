@@ -3,7 +3,8 @@ channels:
   - pytorch
   - nvidia
   - conda-forge
-  - defaults
+  - https://conda.rosettacommons.org
+  
 dependencies:
   - cudatoolkit=11.1
   - python=3.9
