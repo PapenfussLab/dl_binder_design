@@ -87,11 +87,20 @@ class sample_features():
         '''
             Parse which residues are fixed from the residue remarks
         '''
-
         # Iterate over the residue positions in this pose and check if they are fixed
         fixed_list = []
 
-        endA = self.pose.split_by_chain()[1].total_residue()
+        # Get ordered unique chainIDs for the pose first
+        self.chains = list( OrderedDict.fromkeys( [ self.pose.pdb_info().chain(i) for i in range1( self.pose.total_residue() ) ] ) )
+        
+        # Determine the range of residues to check
+        if len(self.chains) == 1:
+            # For single chain, check all residues
+            endA = self.pose.total_residue()
+        else:
+            # For multi-chain, check only first chain
+            endA = self.pose.split_by_chain()[1].total_residue()
+        
         for resi in range1( endA ):
             reslabels = self.pose.pdb_info().get_reslabels( resi )
 
@@ -100,16 +109,17 @@ class sample_features():
             if str(self.pose.pdb_info().get_reslabels( resi )[1]).strip() == 'FIXED':
                 fixed_list.append( resi )
 
-        # Get ordered unique chainIDs for the pose
-        # The last chain (B) is the target and will have a fixed sequence
-        self.chains = list( OrderedDict.fromkeys( [ self.pose.pdb_info().chain(i) for i in range1( self.pose.total_residue() ) ] ) )
-
         # Create the fixed res dict, this will be input to ProteinMPNN
-        self.fixed_res = {
-            self.chains[0]: fixed_list,
-            self.chains[1]: []
-        }
-    
+        if len(self.chains) == 1:
+            self.fixed_res = {
+                self.chains[0]: fixed_list
+            }
+        else:
+            self.fixed_res = {
+                self.chains: fixed_list,
+                self.chains[1]: []
+            }
+
     def thread_mpnn_seq(self, binder_seq):
         '''
         Thread the binder sequence onto the pose being designed
@@ -173,24 +183,30 @@ class ProteinMPNN_runner():
             # Not using AA bias
             self.bias_AAs_np = np.zeros(len(alphabet))
 
-        # Configs for the FastRelax cycles
-        xml = os.path.join(script_dir, 'RosettaFastRelaxUtil.xml')
-        objs = protocols.rosetta_scripts.XmlObjects.create_from_file(xml)
+        # Load target-binder FastRelax mover
+        xml_binder = os.path.join(script_dir, 'RosettaFastRelaxUtil.xml')
+        objs_binder = protocols.rosetta_scripts.XmlObjects.create_from_file(xml_binder)
+        self.FastRelax_binder = objs_binder.get_mover('FastRelax')
 
-        self.FastRelax = objs.get_mover('FastRelax')
+        # Load monomer FastRelax mover (new)
+        xml_monomer = os.path.join(script_dir, 'RosettaFastRelaxUtilMonomer.xml')
+        objs_monomer = protocols.rosetta_scripts.XmlObjects.create_from_file(xml_monomer)
+        self.FastRelax_monomer = objs_monomer.get_mover('FastRelaxMonomer')
 
         self.relax_max_cycles = args.relax_max_cycles
 
     def relax_pose(self, sample_feats):
         '''
-        Run FastRelax on the current pose
+        Run FastRelax on the current pose using appropriate protocol
         '''
-
         relaxT0 = int(time.time())
 
-        print('Running FastRelax')
-
-        self.FastRelax.apply(sample_feats.pose)
+        if len(sample_feats.chains) == 1:
+            print('Running monomer FastRelax')
+            self.FastRelax_monomer.apply(sample_feats.pose)
+        else:
+            print('Running binder FastRelax')
+            self.FastRelax_binder.apply(sample_feats.pose)
 
         print(f"Completed one cycle of FastRelax in {int(time.time()) - relaxT0} seconds")
 
@@ -211,8 +227,14 @@ class ProteinMPNN_runner():
         arg_dict = mpnn_util.set_default_args(num_seqs, omit_AAs=self.omit_AAs)
         arg_dict['temperature'] = self.temperature
 
-        masked_chains  = sample_feats.chains[:-1]
-        visible_chains = [sample_feats.chains[-1]]
+        if len(sample_feats.chains) == 1:
+            # For single chain design: mask the chain to design it
+            masked_chains = sample_feats.chains
+            visible_chains = []
+        else:
+            # For multi-chain design: mask binder(s), keep target visible
+            masked_chains = sample_feats.chains[:-1]
+            visible_chains = [sample_feats.chains[-1]]
 
         fixed_positions_dict = {pdbfile[:-len('.pdb')]: sample_feats.fixed_res}
 
@@ -362,7 +384,7 @@ class ProteinMPNN_runner():
 
         seconds = int(time.time() - t0)
 
-        print( f"Struct: {pdb} reported success in {seconds} seconds" )
+        print( f"Struct: {pdb} reported success in {seconds} seconds\n" )
 
 class StructManager():
     '''
