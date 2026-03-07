@@ -3,6 +3,7 @@
 import numpy as np
 from typing import Tuple, Optional, Set, List, Dict
 from collections import OrderedDict
+import io
 
 from alphafold.common import residue_constants
 
@@ -21,6 +22,18 @@ def parse_pdb_residues(pdb_fn: str, chain_ids: Optional[Set[str]] = None) -> Lis
     """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("input", pdb_fn)
+    return _parse_structure_residues(structure, chain_ids)
+
+
+def parse_pdb_residues_from_text(pdb_text: str, chain_ids: Optional[Set[str]] = None) -> List[Dict]:
+    """Parse CA-bearing protein residues from PDB text using Biopython."""
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("input", io.StringIO(pdb_text))
+    return _parse_structure_residues(structure, chain_ids)
+
+
+def _parse_structure_residues(structure, chain_ids: Optional[Set[str]] = None) -> List[Dict]:
+    """Shared residue parser from a Biopython Structure object."""
     residues = []
 
     for model in structure:
@@ -143,40 +156,8 @@ def parse_initial_guess(all_atom_positions) -> jnp.ndarray:
 
     return jnp.array(templates_all_atom_positions)
 
-
-def _idealize_cb_from_backbone(pos: np.ndarray, mask: np.ndarray) -> None:
-    """Fill missing CB from N/CA/C for non-glycine residues in-place."""
-    n_idx = residue_constants.atom_order["N"]
-    ca_idx = residue_constants.atom_order["CA"]
-    c_idx = residue_constants.atom_order["C"]
-    cb_idx = residue_constants.atom_order["CB"]
-
-    if mask[cb_idx] > 0.0:
-        return
-    if not (mask[n_idx] > 0.0 and mask[ca_idx] > 0.0 and mask[c_idx] > 0.0):
-        return
-
-    n = pos[n_idx]
-    ca = pos[ca_idx]
-    c = pos[c_idx]
-    b = ca - n
-    c_vec = c - ca
-    a = np.cross(b, c_vec)
-
-    # Canonical AF2-style idealized CB placement from N, CA, C.
-    cb = ca + (-0.58273431 * a + 0.56802827 * b - 0.54067466 * c_vec)
-    pos[cb_idx] = cb.astype(np.float32)
-    mask[cb_idx] = 1.0
-
-def af2_get_atom_positions(pdb_fn: str, chain_ids: Optional[Set[str]] = None) -> Tuple[np.ndarray, np.ndarray]:
-    '''
-    Given a pdb filename, return the AF2 atom positions array and atom mask array.
-
-    Args:
-        pdb_fn (str): Path to a pdb file.
-        chain_ids (set[str] | None): If provided, only parse these chain IDs.
-    '''
-    residues = parse_pdb_residues(pdb_fn, chain_ids)
+def _af2_get_atom_positions_from_residues(residues: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+    """Build AF2 atom positions/masks from parsed residue records."""
     num_res = len(residues)
     all_positions = np.zeros([num_res, residue_constants.atom_type_num, 3], dtype=np.float32)
     all_positions_mask = np.zeros([num_res, residue_constants.atom_type_num], dtype=np.int64)
@@ -198,12 +179,96 @@ def af2_get_atom_positions(pdb_fn: str, chain_ids: Optional[Set[str]] = None) ->
                 pos[residue_constants.atom_order['SD']] = [x, y, z]
                 mask[residue_constants.atom_order['SD']] = 1.0
 
-        _idealize_cb_from_backbone(pos, mask)
-
         all_positions[idx] = pos
         all_positions_mask[idx] = mask
 
     return all_positions, all_positions_mask
+
+
+def af2_get_atom_positions(pdb_fn: str, chain_ids: Optional[Set[str]] = None) -> Tuple[np.ndarray, np.ndarray]:
+    '''
+    Given a pdb filename, return the AF2 atom positions array and atom mask array.
+
+    Args:
+        pdb_fn (str): Path to a pdb file.
+        chain_ids (set[str] | None): If provided, only parse these chain IDs.
+    '''
+    residues = parse_pdb_residues(pdb_fn, chain_ids)
+    return _af2_get_atom_positions_from_residues(residues)
+
+
+def af2_get_atom_positions_from_pdb_text(pdb_text: str, chain_ids: Optional[Set[str]] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Given PDB text, return AF2 atom positions and atom masks."""
+    residues = parse_pdb_residues_from_text(pdb_text, chain_ids)
+    return _af2_get_atom_positions_from_residues(residues)
+
+
+def complete_pdb_backbone_to_all_atom_text(pdb_fn: str) -> Tuple[str, int]:
+    """
+    Use PDBFixer to add missing heavy atoms, returning completed PDB text.
+
+    Returns:
+        tuple[str, int]: (completed_pdb_text, number_of_missing_atoms_identified)
+    """
+    try:
+        from pdbfixer import PDBFixer
+    except ImportError as exc:
+        raise ImportError(
+            "PDBFixer is required for atom completion. Install it (e.g. `conda install -c conda-forge pdbfixer`)."
+        ) from exc
+
+    try:
+        from openmm.app import PDBFile
+    except ImportError:
+        from simtk.openmm.app import PDBFile
+
+    fixer = PDBFixer(filename=pdb_fn)
+    fixer.findMissingResidues()
+    fixer.findMissingAtoms()
+    missing_atom_count = sum(len(atom_list) for atom_list in fixer.missingAtoms.values())
+    fixer.addMissingAtoms()
+
+    out_buf = io.StringIO()
+    PDBFile.writeFile(fixer.topology, fixer.positions, out_buf, keepIds=True)
+    return out_buf.getvalue(), missing_atom_count
+
+
+def optimize_rotamers_with_pyfaspr(pdb_text: str) -> str:
+    """
+    Optimize side-chain rotamers using pyfaspr, operating fully in memory.
+
+    Args:
+        pdb_text (str): Input structure as PDB text.
+
+    Returns:
+        str: Rotamer-optimized PDB text.
+    """
+    try:
+        import pyfaspr
+    except ImportError as exc:
+        raise ImportError(
+            "pyfaspr is required for rotamer optimization. Install it (e.g. `pip install pyfaspr`)."
+        ) from exc
+
+    if not hasattr(pyfaspr, "run_FASPR"):
+        raise AttributeError("pyfaspr module does not expose `run_FASPR`.")
+
+    result = pyfaspr.run_FASPR(pdb=pdb_text)
+
+    if isinstance(result, bytes):
+        return result.decode("utf-8")
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        for key in ("pdb", "pdb_out", "output_pdb", "result_pdb"):
+            if key in result and isinstance(result[key], str):
+                return result[key]
+    if isinstance(result, tuple):
+        for item in result:
+            if isinstance(item, str):
+                return item
+
+    raise TypeError(f"Unexpected return type from pyfaspr.run_FASPR: {type(result)}")
 
 def insert_truncations(residue_index, Ls) -> np.ndarray:
     '''

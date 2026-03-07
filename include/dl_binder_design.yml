@@ -19,3 +19,5 @@ dependencies:
     - jaxlib==0.1.70+cuda111
     - dm-haiku==0.0.5
     - dm-tree==0.1.6
+    - pyfaspr
+    - pdbfixer
