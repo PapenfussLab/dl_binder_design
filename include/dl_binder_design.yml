@@ -3,13 +3,11 @@ channels:
   - pytorch
   - nvidia
   - conda-forge
-  - https://conda.rosettacommons.org
   
 dependencies:
   - cudatoolkit=11.1
   - python=3.9
   - pytorch=1.9
-  - pyrosetta
   - biopython
   - ml-collections
   - tensorflow

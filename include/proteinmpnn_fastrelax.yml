@@ -8,7 +8,6 @@ dependencies:
   - pytorch=2.0
   - biopython
   - ml-collections
-  - pyrosetta
   - numpy<2.0
   - nomkl
   - openblas

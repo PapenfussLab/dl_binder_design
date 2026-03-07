@@ -3,14 +3,13 @@
 import os
 import numpy as np
 import sys
+import pickle
 
 from timeit import default_timer as timer
 import argparse
 import glob
-import uuid
 
 import jax
-import jax.numpy as jnp
 
 from jax.lib import xla_bridge
 
@@ -24,15 +23,42 @@ from alphafold.model import model
 
 import af2_util
 
-parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(parent, 'include'))
-from silent_tools import silent_tools
 
-from pyrosetta import *
-from rosetta import *
-init( '-in:file:silent_struct_type binary -mute all' )
+def _rewrite_chain_ids(pdb_text, binderlen):
+    """Assign output chain IDs (A/B) by residue index and insert TER between chains."""
+    if binderlen < 0:
+        return pdb_text
 
-def range1(size): return range(1, size+1)
+    out_lines = []
+    resid_to_idx = {}
+    next_idx = 0
+    inserted_ter = False
+
+    for line in pdb_text.splitlines(True):
+        if line.startswith("TER"):
+            continue
+
+        if line.startswith("ATOM") or line.startswith("HETATM"):
+            chain_id = line[21]
+            resseq = int(line[22:26])
+            icode = line[26]
+            resid = (chain_id, resseq, icode)
+
+            if resid not in resid_to_idx:
+                resid_to_idx[resid] = next_idx
+                if next_idx == binderlen and not inserted_ter and binderlen > 0:
+                    out_lines.append("TER\n")
+                    inserted_ter = True
+                next_idx += 1
+
+            resid_idx = resid_to_idx[resid]
+            new_chain = "A" if resid_idx < binderlen else "B"
+            line = f"{line[:21]}{new_chain}{line[22:]}"
+
+        out_lines.append(line)
+
+    return "".join(out_lines)
+
 
 #################################
 # Parse Arguments
@@ -41,52 +67,53 @@ def range1(size): return range(1, size+1)
 parser = argparse.ArgumentParser()
 
 # I/O Arguments
-parser.add_argument( "-pdbdir", type=str, default="", help='The name of a directory of pdbs to run through the model' )
-parser.add_argument( "-silent", type=str, default="", help='The name of a silent file to run through the model' )
-parser.add_argument( "-outpdbdir", type=str, default="outputs", help='The directory to which the output PDB files will be written. Only used when -pdbdir is active' )
-parser.add_argument( "-outsilent", type=str, default="out.silent", help='The name of the silent file to which output structs will be written. Only used when -silent is active' )
-parser.add_argument( "-runlist", type=str, default='', help="The path of a list of pdb tags to run. Only used when -pdbdir is active (default: ''; Run all PDBs)" )
-parser.add_argument( "-checkpoint_name", type=str, default='check.point', help="The name of a file where tags which have finished will be written (default: check.point)" )
-parser.add_argument( "-scorefilename", type=str, default='out.sc', help="The name of a file where scores will be written (default: out.sc)" )
-parser.add_argument( "-maintain_res_numbering", action="store_true", default=False, help='When active, the model will not renumber the residues when bad inputs are encountered (default: False)' )
+parser.add_argument("-pdbdir", type=str, default="", help='The name of a directory of pdbs to run through the model')
+parser.add_argument("-outpdbdir", type=str, default="outputs", help='The directory to which the output PDB files will be written. Only used when -pdbdir is active')
+parser.add_argument("-runlist", type=str, default='', help="The path of a list of pdb tags to run. Only used when -pdbdir is active (default: ''; Run all PDBs)")
+parser.add_argument("-checkpoint_name", type=str, default='check.point', help="The name of a file where tags which have finished will be written (default: check.point)")
+parser.add_argument("-scorefilename", type=str, default='out.sc', help="The name of a file where scores will be written (default: out.sc)")
+parser.add_argument("-maintain_res_numbering", action="store_true", default=False, help='Unused in no-PyRosetta mode')
 
-parser.add_argument( "-debug", action="store_true", default=False, help='When active, errors will cause the script to crash and the error message to be printed out (default: False)')
+parser.add_argument("-debug", action="store_true", default=False, help='When active, errors will cause the script to crash and the error message to be printed out (default: False)')
+parser.add_argument("-debug_print", action="store_true", default=False, help='When active, print per-structure parser/feature diagnostics (default: False)')
+parser.add_argument(
+    "-feature_dump_dir",
+    type=str,
+    default="",
+    help="Optional directory to write featurized AF2 feature dicts (.pkl) for diagnostics",
+)
 
 # AF2-Specific Arguments
-parser.add_argument( "-max_amide_dist", type=float, default=3.0, help='The maximum distance between an amide bond\'s carbon and nitrogen (default: 3.0)' )
-parser.add_argument( "-recycle", type=int, default=3, help='The number of AF2 recycles to perform (default: 3)' )
-parser.add_argument( "-no_initial_guess", action="store_true", default=False, help='When active, the model will not use an initial guess (default: False)' )
-parser.add_argument( "-force_monomer", action="store_true", default=False, help='When active, the model will predict the structure of a monomer (default: False)' )
+parser.add_argument("-max_amide_dist", type=float, default=3.0, help='The maximum distance between an amide bond\'s carbon and nitrogen (default: 3.0)')
+parser.add_argument("-recycle", type=int, default=3, help='The number of AF2 recycles to perform (default: 3)')
+parser.add_argument("-no_initial_guess", action="store_true", default=False, help='When active, the model will not use an initial guess (default: False)')
+parser.add_argument("-force_monomer", action="store_true", default=False, help='When active, predict only the first chain in a two-chain pdb as a monomer (default: False)')
 
 args = parser.parse_args()
 
-class FeatureHolder():
-    '''
-    This is a struct which holds the features for a single structure being run through the model
-    '''
 
-    def __init__(self, pose, monomer, binderlen, tag):
-        self.pose   = pose
-        self.tag    = tag
+class FeatureHolder():
+    """Hold model features and outputs for one structure."""
+
+    def __init__(self, struct_data, monomer, binderlen, tag):
+        self.tag = tag
         self.outtag = self.tag + '_af2pred'
-        
-        self.seq       = pose.sequence()
+
+        self.seq = struct_data["seq"]
         self.binderlen = binderlen
-        self.monomer   = monomer
-        
+        self.monomer = monomer
+
         # Pre model features
-        self.initial_all_atom_positions = None
-        self.initial_all_atom_masks = None
+        self.initial_all_atom_positions = struct_data["all_atom_positions"]
+        self.initial_all_atom_masks = struct_data["all_atom_masks"]
 
         # Post model features
-        self.outpose     = None
         self.plddt_array = None
-        self.score_dict  = None
+        self.score_dict = None
+
 
 class AF2_runner():
-    '''
-    This class handles generating features, running the model, and parsing outputs
-    '''
+    """Handle feature generation, model execution, and output parsing."""
 
     def __init__(self, args, struct_manager):
 
@@ -111,137 +138,120 @@ class AF2_runner():
         model_config.data.common.max_extra_msa = 5
         model_config.data.eval.max_msa_clusters = 5
 
-        params_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),'model_weights')
+        params_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'model_weights')
 
         model_params = data.get_model_haiku_params(model_name=self.model_name, data_dir=params_dir)
 
         self.model_runner = model.RunModel(model_config, model_params)
 
-    def featurize(self, feat_holder) -> None:
+    def featurize(self, feat_holder, pdb_path):
 
-        all_atom_positions, all_atom_masks = af2_util.af2_get_atom_positions(feat_holder.pose, self.struct_manager.tmp_fn)
+        all_atom_positions, all_atom_masks = af2_util.af2_get_atom_positions(pdb_path)
 
         feat_holder.initial_all_atom_positions = all_atom_positions
         feat_holder.initial_all_atom_masks     = all_atom_masks
-
+        
         initial_guess = af2_util.parse_initial_guess(feat_holder.initial_all_atom_positions)
 
         # Determine which residues to template
         if feat_holder.monomer:
             # For monomers predict all residues
-            feat_holder.residue_mask = [False for i in range(len(feat_holder.seq))]
+            feat_holder.residue_mask = [False for _ in range(len(feat_holder.seq))]
         else:
             # For interfaces fix the target and predict the binder
             feat_holder.residue_mask = [int(i) > feat_holder.binderlen for i in range(len(feat_holder.seq))]
 
         template_dict = af2_util.generate_template_features(
-                                                            feat_holder.seq,
-                                                            feat_holder.initial_all_atom_positions,
-                                                            feat_holder.initial_all_atom_masks,
-                                                            feat_holder.residue_mask
-                                                           )
-        # Gather features
+            feat_holder.seq,
+            feat_holder.initial_all_atom_positions,
+            feat_holder.initial_all_atom_masks,
+            feat_holder.residue_mask,
+        )
+
         feature_dict = {
             **pipeline.make_sequence_features(sequence=feat_holder.seq,
-                                            description="none",
-                                            num_res=len(feat_holder.seq)),
+                                              description="none",
+                                              num_res=len(feat_holder.seq)),
             **pipeline.make_msa_features(msas=[[feat_holder.seq]],
-                                        deletion_matrices=[[[0]*len(feat_holder.seq)]]),
-            **template_dict
+                                         deletion_matrices=[[[0] * len(feat_holder.seq)]]),
+            **template_dict,
         }
 
         if feat_holder.monomer:
             breaks = []
         else:
             breaks = af2_util.check_residue_distances(
-                            feat_holder.initial_all_atom_positions,
-                            feat_holder.initial_all_atom_masks,
-                            self.max_amide_dist
-                        )
+                feat_holder.initial_all_atom_positions,
+                feat_holder.initial_all_atom_masks,
+                self.max_amide_dist,
+            )
+
+        if self.struct_manager.debug_print:
+            templated_res = int(np.sum(feat_holder.residue_mask))
+            predicted_res = len(feat_holder.residue_mask) - templated_res
+            print(
+                f"[debug_print] tag={feat_holder.tag} "
+                f"seq_len={len(feat_holder.seq)} "
+                f"templated_res={templated_res} "
+                f"predicted_res={predicted_res} "
+                f"breaks={breaks}"
+            )
 
         feature_dict['residue_index'] = af2_util.insert_truncations(feature_dict['residue_index'], breaks)
 
         feature_dict = self.model_runner.process_features(feature_dict, random_seed=0)
 
-        return feature_dict, initial_guess 
+        return feature_dict, initial_guess
 
-    def calculate_rmsd_target(self, feat_holder) -> float:
-        """
-        Calculate RMSD of the target chain CA atoms aligned on themselves.
-        Returns nan for monomers since there's no target chain.
-        """
+    def calculate_rmsd_target(self, feat_holder, pred_ca):
+        """Calculate target-chain CA RMSD aligned on target residues."""
         if feat_holder.monomer or feat_holder.binderlen < 0:
             return float('nan')
-        
-        # Get initial and predicted CA coordinates
-        init_ca = feat_holder.initial_all_atom_positions[:, 1, :]  # CA atoms from initial
-        
-        try:
-            # Extract predicted CA coordinates from Rosetta pose
-            pred_ca = np.array([feat_holder.outpose.residue(i+1).atom('CA').xyz() 
-                            for i in range(feat_holder.outpose.size())])
-        except Exception as e:
-            print(f"Warning: Could not extract predicted CA coordinates for {feat_holder.tag}: {e}")
-            return float('nan')
-        
-        # Target residue indices (from binderlen onwards)
-        target_indices = np.arange(feat_holder.binderlen, len(feat_holder.seq))
-        
-        # Calculate target RMSD (target aligned on target)
-        rmsd_target = af2_util.subset_rmsd(
-            xyz1=init_ca,
-            align1=target_indices,  # Align on target residues
-            calc1=target_indices,   # Calculate over target residues
-            xyz2=pred_ca,
-            align2=target_indices,  # Align on target residues
-            calc2=target_indices    # Calculate over target residues
-        )
-        
-        return rmsd_target
 
-    def generate_scoredict(self, feat_holder, confidences, rmsds) -> None:
-        """
-        Collect the confidence values and calculate scores based on monomer vs binder design
-        """
+        init_ca = feat_holder.initial_all_atom_positions[:, 1, :]
+        target_indices = np.arange(feat_holder.binderlen, len(feat_holder.seq))
+
+        return af2_util.subset_rmsd(
+            xyz1=init_ca,
+            align1=target_indices,
+            calc1=target_indices,
+            xyz2=pred_ca,
+            align2=target_indices,
+            calc2=target_indices,
+        )
+
+    def generate_scoredict(self, feat_holder, confidences, rmsds, pred_ca):
+        """Collect confidence values and derive final score dict."""
         binderlen = feat_holder.binderlen
         plddt_array = confidences['plddt']
         plddt_overall = np.mean(plddt_array)
         pae = confidences['predicted_aligned_error']
 
-        # Calculate rmsd_overall as CA RMSD over all residues
-        # Need to get predicted CA coordinates from the pose
-        predicted_ca = np.array([feat_holder.outpose.residue(i+1).atom('CA').xyz() 
-                                for i in range(feat_holder.outpose.size())])
-        
         rmsd_overall = af2_util.subset_rmsd(
-            xyz1=feat_holder.initial_all_atom_positions[:, 1, :],  # CA atoms from initial
-            align1=np.arange(len(plddt_array)),                    # Align on all residues
-            calc1=np.arange(len(plddt_array)),                     # Calculate over all residues
-            xyz2=predicted_ca,                                     # Predicted CA coordinates
-            align2=np.arange(len(plddt_array)),                    # Align on all residues
-            calc2=np.arange(len(plddt_array))                      # Calculate over all residues
+            xyz1=feat_holder.initial_all_atom_positions[:, 1, :],
+            align1=np.arange(len(plddt_array)),
+            calc1=np.arange(len(plddt_array)),
+            xyz2=pred_ca,
+            align2=np.arange(len(plddt_array)),
+            calc2=np.arange(len(plddt_array)),
         )
 
         if feat_holder.monomer:
-            # Monomer scoring: only overall metrics
             score_dict = {
                 "plddt_overall": plddt_overall,
                 "pae_overall": np.mean(pae),
                 "rmsd_overall": rmsd_overall,
-                "time": timer() - self.t0
+                "time": timer() - self.t0,
             }
         else:
-            # Calculate rmsd_target
-            rmsd_target = self.calculate_rmsd_target(feat_holder)
-            # Binder scoring: detailed breakdown
+            rmsd_target = self.calculate_rmsd_target(feat_holder, pred_ca)
             plddt_binder = np.mean(plddt_array[:binderlen])
             plddt_target = np.mean(plddt_array[binderlen:])
 
             pae_overall = np.mean(pae)
             pae_binder = np.mean(pae[:binderlen, :binderlen])
             pae_target = np.mean(pae[binderlen:, binderlen:])
-            
-            # Calculate interaction PAE (binder-target interface)
+
             pae_interaction1 = np.mean(pae[:binderlen, binderlen:])
             pae_interaction2 = np.mean(pae[binderlen:, :binderlen])
             pae_interaction = (pae_interaction1 + pae_interaction2) / 2
@@ -258,151 +268,113 @@ class AF2_runner():
                 "rmsd_binder_bndaln": rmsds['binder_aligned_rmsd'],
                 "rmsd_binder_tgtaln": rmsds['target_aligned_rmsd'],
                 "rmsd_target": rmsd_target,
-                "time": timer() - self.t0
+                "time": timer() - self.t0,
             }
 
-        # Store scores and output
         feat_holder.score_dict = score_dict
         self.struct_manager.record_scores(feat_holder.outtag, score_dict, None)
-        
-        print(f"Tag: {feat_holder.outtag} scores: {score_dict}\n")
 
-    def process_output(self, feat_holder, feature_dict, prediction_result) -> None:
-        '''
-        Take the AF2 output, parse the confidence scores from this and register the scores in the score file
-        Also write out the structure
-        '''
+        print(f"Tag: {feat_holder.outtag} scores: {score_dict}\\n")
 
-        # First extract the structure and confidence scores from the prediction result
+    def process_output(self, feat_holder, feature_dict, prediction_result):
+        """Parse AF2 output, score it, and write output pdb."""
+
         structure_module = prediction_result['structure_module']
+
+        confidences = {}
+        confidences['distogram'] = prediction_result['distogram']
+        confidences['plddt'] = confidence.compute_plddt(
+            prediction_result['predicted_lddt']['logits'][...])
+        if 'predicted_aligned_error' in prediction_result:
+            confidences.update(confidence.compute_predicted_aligned_error(
+                prediction_result['predicted_aligned_error']['logits'][...],
+                prediction_result['predicted_aligned_error']['breaks'][...]))
+
+        feat_holder.plddt_array = confidences['plddt']
+
+        b_factors = np.repeat(confidences['plddt'][:, None], residue_constants.atom_type_num, axis=1)
         this_protein = protein.Protein(
             aatype=feature_dict['aatype'][0],
             atom_positions=structure_module['final_atom_positions'][...],
             atom_mask=structure_module['final_atom_mask'][...],
             residue_index=feature_dict['residue_index'][0] + 1,
-            b_factors=np.zeros_like(structure_module['final_atom_mask'][...]) )
-
-        confidences = {}
-        confidences['distogram'] = prediction_result['distogram']
-        confidences['plddt'] = confidence.compute_plddt(
-                prediction_result['predicted_lddt']['logits'][...])
-        if 'predicted_aligned_error' in prediction_result:
-            confidences.update(confidence.compute_predicted_aligned_error(
-                prediction_result['predicted_aligned_error']['logits'][...],
-                prediction_result['predicted_aligned_error']['breaks'][...]))
-        
-        feat_holder.plddt_array = confidences['plddt']
-
-        # Calculate the RMSDs
-        target_mask = np.zeros(len(feat_holder.seq), dtype=bool)
-        target_mask[feat_holder.binderlen:] = True
-
-        rmsds = af2_util.calculate_rmsds(
-            feat_holder.initial_all_atom_positions,
-            this_protein.atom_positions,
-            target_mask
+            b_factors=b_factors,
         )
 
-        # Write the structure as a pdb file so Rosetta can read it
+        if feat_holder.monomer:
+            rmsds = {
+                'binder_aligned_rmsd': float('nan'),
+                'target_aligned_rmsd': float('nan'),
+            }
+        else:
+            target_mask = np.zeros(len(feat_holder.seq), dtype=bool)
+            target_mask[feat_holder.binderlen:] = True
+            rmsds = af2_util.calculate_rmsds(
+                feat_holder.initial_all_atom_positions,
+                this_protein.atom_positions,
+                target_mask,
+            )
+
+        pred_ca = this_protein.atom_positions[:, 1, :]
+        self.generate_scoredict(feat_holder, confidences, rmsds, pred_ca)
+
         unrelaxed_pdb_lines = protein.to_pdb(this_protein)
-        
-        with open(self.struct_manager.tmp_fn, 'w') as f: f.write(unrelaxed_pdb_lines)
+        self.struct_manager.dump_pdb(feat_holder, unrelaxed_pdb_lines)
 
-        # Now read the structure to a Rosetta pose
-        feat_holder.outpose = pyrosetta.pose_from_file(self.struct_manager.tmp_fn)
+    def process_struct(self, pdb_path):
 
-        os.remove(self.struct_manager.tmp_fn)
-        
-        # Now we can finally write the scores and the predicted structure to disk
-        self.generate_scoredict(feat_holder, confidences, rmsds)
-        self.struct_manager.dump_pose(feat_holder)
-    
-    def process_struct(self, tag) -> None:
-
-        # Start the timer
         self.t0 = timer()
 
-        # Load the structure
-        pose, monomer, binderlen, usetag = self.struct_manager.load_pose(tag)
-
-        # Store the pose in the feature holder
-        feat_holder = FeatureHolder(pose, monomer, binderlen, usetag)
+        struct_data, monomer, binderlen, usetag = self.struct_manager.load_pose(pdb_path)
+        feat_holder = FeatureHolder(struct_data, monomer, binderlen, usetag)
 
         print(f'Processing struct with tag: {feat_holder.tag}')
 
-        # Generate features
-        feature_dict, initial_guess = self.featurize(feat_holder)
+        feature_dict, initial_guess = self.featurize(feat_holder, pdb_path)
 
-        # Run model
         start = timer()
         print(f'Running {self.model_name}')
 
-        prediction_result = self.model_runner.apply( self.model_runner.params,
-                                                     jax.random.PRNGKey(0),
-                                                     feature_dict,
-                                                     initial_guess )
+        prediction_result = self.model_runner.apply(
+            self.model_runner.params,
+            jax.random.PRNGKey(0),
+            feature_dict,
+            initial_guess,
+        )
 
         print(f'Tag: {feat_holder.tag} finished AF2 prediction in {timer() - start} seconds')
 
-        # Process outputs
         self.process_output(feat_holder, feature_dict, prediction_result)
 
-class StructManager():
-    '''
-    This class handles all of the input and output for the AF2 model. It deals with silent files vs. pdbs,
-    checkpointing, and writing of outputs
 
-    Note: This class could be moved to a separate file and shared with ProteinMPNN
-    '''
+class StructManager():
+    """Handle input/output, runlist filtering, and checkpointing for pdb mode."""
 
     def __init__(self, args):
         self.args = args
 
-        self.maintain_res_numbering = args.maintain_res_numbering
-
+        self.force_monomer = args.force_monomer
+        self.debug_print = args.debug_print
+        self.feature_dump_dir = args.feature_dump_dir
         self.score_fn = args.scorefilename
 
-        # Generate a random unique temporary filename
-        self.tmp_fn = f'tmp_{uuid.uuid4()}.pdb'
+        if args.pdbdir == '':
+            raise ValueError('Please provide `-pdbdir` (pdb mode only).')
 
-        self.force_monomer = args.force_monomer
+        self.pdbdir = args.pdbdir
+        self.outpdbdir = args.outpdbdir
 
-        self.silent = False
-        if not args.silent == '':
-            self.silent = True
+        self.struct_iterator = glob.glob(os.path.join(args.pdbdir, '*.pdb'))
 
-            self.struct_iterator = silent_tools.get_silent_index(args.silent)['tags']
+        if args.runlist != '':
+            with open(args.runlist, 'r') as f:
+                runlist = set(line.strip() for line in f)
+            self.struct_iterator = [
+                struct for struct in self.struct_iterator
+                if '.'.join(os.path.basename(struct).split('.')[:-1]) in runlist
+            ]
+            print(f'After filtering by runlist, {len(self.struct_iterator)} structures remain')
 
-            self.sfd_in = rosetta.core.io.silent.SilentFileData(rosetta.core.io.silent.SilentFileOptions())
-            self.sfd_in.read_file(args.silent)
-
-            self.sfd_out = core.io.silent.SilentFileData(args.outsilent, False, False, "binary", core.io.silent.SilentFileOptions())
-
-            self.outsilent = args.outsilent
-
-        self.pdb = False
-        if not args.pdbdir == '':
-            self.pdb = True
-
-            self.pdbdir    = args.pdbdir
-            self.outpdbdir = args.outpdbdir
-
-            self.struct_iterator = glob.glob(os.path.join(args.pdbdir, '*.pdb'))
-
-            # Parse the runlist and determine which structures to process
-            if args.runlist != '':
-                with open(args.runlist, 'r') as f:
-                    self.runlist = set([line.strip() for line in f])
-
-                    # Filter the struct iterator to only include those in the runlist
-                    self.struct_iterator = [struct for struct in self.struct_iterator if '.'.join(os.path.basename(struct).split('.')[:-1]) in self.runlist]
-
-                    print(f'After filtering by runlist, {len(self.struct_iterator)} structures remain')
-
-        # Assert that either silent or pdb is true, but not both
-        assert(self.silent ^ self.pdb), f'Both silent and pdb are set to {args.silent} and {args.pdb} respectively. Only one of these may be active at a time'
-
-        # Setup checkpointing
         self.chkfn = args.checkpoint_name
         self.finished_structs = set()
 
@@ -411,170 +383,112 @@ class StructManager():
                 for line in f:
                     self.finished_structs.add(line.strip())
 
-    def input_check(self, pose, tag) -> bool:
-        '''
-        This function checks that the given pose is valid for AF2. It specifically
-        checks that all residue indices are unique
-        '''
-        
-        seen_indices = set()
-        
-        # Loop through the PDBinfo of the pose and check that all residue indices are unique
-        pdbinfo = pose.pdb_info()
-        for resi in range1(pose.size()):
-            residx = pdbinfo.number(resi)
-            if residx in seen_indices:
-                print( f"\nNon-unique residue indices detected for tag: {tag}. " +
-                        "This will cause AF2 to yield garbage outputs." )
-                return False
+    def _tag_from_path(self, pdb_path):
+        return '.'.join(os.path.basename(pdb_path).split('.')[:-1])
 
-            seen_indices.add(residx)
-        
-        return True
-
-    def record_checkpoint(self, tag):
-        '''
-        Record the fact that this tag has been processed.
-        Write this tag to the list of finished structs
-        '''
+    def record_checkpoint(self, pdb_path):
+        tag = self._tag_from_path(pdb_path)
         with open(self.chkfn, 'a') as f:
-            f.write(f'{tag}\n')
+            f.write(f'{tag}\\n')
 
     def iterate(self):
-        '''
-        Iterate over the silent file or pdb directory and run the model on each structure
-        '''
-
-        # Iterate over the structs and for each, check that the struct has not already been processed
         for struct in self.struct_iterator:
-            if self.pdb:
-                tag = '.'.join(os.path.basename(struct).split('.')[:-1])
-            else:
-                tag = struct    
-
+            tag = self._tag_from_path(struct)
             if tag in self.finished_structs:
                 print(f'{tag} has already been processed. Skipping')
                 continue
-
             yield struct
 
     def record_scores(self, tag, score_dict, string_dict):
-        '''
-        Record the scores for this structure to the score file.
+        write_header = not os.path.isfile(self.score_fn)
+        af2_util.add2scorefile(tag, self.score_fn, write_header, score_dict, string_dict)
 
-        Args:
-            tag (str): The tag for this structure
-            score_dict (dict): A dictionary of numerical scores to record
-            string_dict (dict): A dictionary of string scores to record
-        '''
+    def dump_pdb(self, feat_holder, pdb_text):
+        if not os.path.exists(self.outpdbdir):
+            os.makedirs(self.outpdbdir)
 
-        # Check whether the score file exists
-        write_header = False
-        if not os.path.isfile(self.score_fn):
-            write_header = True
-
-        af2_util.add2scorefile(tag, self.score_fn, write_header, score_dict, string_dict) 
-
-    def dump_pose(self, feat_holder):
-        '''
-        Dump this pose to either a silent file or a pdb file depending on the input arguments
-        '''
-        
         if feat_holder.monomer:
-            pose = feat_holder.outpose
+            out_text = pdb_text
         else:
-            # Insert chainbreaks into the pose
-            pose = af2_util.insert_Rosetta_chainbreaks(feat_holder.outpose, feat_holder.binderlen)
+            out_text = _rewrite_chain_ids(pdb_text, feat_holder.binderlen)
 
-        # Add the plddt scores as b-factors to the pose
-        info = pose.pdb_info()
-        for resi in range1(pose.size()):
-            info.add_reslabel(resi, f'{feat_holder.plddt_array[resi-1]}')
-            for atom_i in range1(pose.residue(resi).natoms()):
-                info.bfactor(resi, atom_i, feat_holder.plddt_array[resi-1])
-        
-        # Assign the pose the updated pdb_info
-        pose.pdb_info(info)
+        pdbfile = os.path.join(self.outpdbdir, feat_holder.outtag + '.pdb')
+        with open(pdbfile, 'w') as handle:
+            handle.write(out_text)
 
-        if self.pdb:
-            # If the outpdbdir does not exist, create it
-            # If there are parents in the path that do not exist, create them as well
-            if not os.path.exists(self.outpdbdir):
-                os.makedirs(self.outpdbdir)
+    def dump_feature_dict(self, feat_holder, feature_dict):
+        if self.feature_dump_dir == "":
+            return
 
-            pdbfile = os.path.join(self.outpdbdir, feat_holder.outtag + '.pdb')
-            pose.dump_pdb(pdbfile)
-        
-        if self.silent:
-            struct = self.sfd_out.create_SilentStructOP()
-            struct.fill_struct(pose, feat_holder.outtag)
+        if not os.path.exists(self.feature_dump_dir):
+            os.makedirs(self.feature_dump_dir)
 
-            # Write the scores to the silent file
-            for scorename, value in feat_holder.score_dict.items():
-                struct.add_energy(scorename, value, 1)
+        out_fn = os.path.join(self.feature_dump_dir, feat_holder.outtag + "_features.pkl")
+        with open(out_fn, "wb") as handle:
+            pickle.dump(feature_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-            self.sfd_out.add_structure(struct)
-            self.sfd_out.write_silent_struct(struct, self.outsilent)
+        if self.debug_print:
+            print(f"[debug_print] dumped featurized features to {out_fn}")
 
-    def load_pose(self, tag):
-        '''
-        Load a pose from either a silent file or a pdb file depending on the input arguments.
+    def load_pose(self, pdb_path):
+        residues = af2_util.parse_pdb_residues(pdb_path)
+        if len(residues) == 0:
+            raise Exception(f'Pose {pdb_path} is empty. This is not supported by this script.')
 
-        Also run input checking on the pose to ensure that it is valid for AF2. The pose
-        will be automatically renumbered if -maintain_res_numbering is not False
-        '''
+        chain_order = []
+        for res in residues:
+            if res["chain"] not in chain_order:
+                chain_order.append(res["chain"])
 
-        if not self.pdb and not self.silent:
-            raise Exception('Neither pdb nor silent is set to True. Cannot load pose')
+        if len(chain_order) > 2:
+            raise Exception(f'Pose {pdb_path} has more than two chains. This is not supported by this script.')
 
-        if self.pdb:
-            pose = pose_from_pdb(tag)
-            usetag = '.'.join(os.path.basename(tag).split('.')[:-1])
-        
-        if self.silent:
-            pose = Pose()
-            usetag = tag
-            self.sfd_in.get_structure(tag).fill_pose(pose)
-        
-        # Run input checking on the pose
-        passes_check = self.input_check(pose, tag)
+        selected_chain_ids = set(chain_order)
+        monomer = False
+        binderlen = -1
 
-        if not passes_check:
-            if not self.maintain_res_numbering:
-                print( f"Renumbering {tag}" )
-                
-                info = core.pose.PDBInfo(pose)
-                pose.pdb_info(info)
-            else:
-                raise Exception( f"Pose {tag} failed input checking.")
+        if len(chain_order) == 1:
+            monomer = True
+        elif self.force_monomer:
+            print("/" * 60)
+            print(f"Pose {pdb_path} has two chains. But force_monomer is set to True. Treating as monomer.")
+            print("I am going to assume that the first chain is the binder and that is the chain I will predict")
+            print("/" * 60)
 
-        # Determine whether we are working with a monomer or a complex
-        splits = pose.split_by_chain()
-        if len(splits) > 2:
-            raise Exception( f"Pose {tag} has more than two chains. This is not supported by this script." )
+            monomer = True
+            selected_chain_ids = {chain_order[0]}
+        else:
+            binderlen = sum(1 for res in residues if res["chain"] == chain_order[0])
 
-        elif len(splits) < 1:
-            raise Exception( f"Pose {tag} is empty. This is not supported by this script." )
+        all_atom_positions, all_atom_masks = af2_util.af2_get_atom_positions(pdb_path, selected_chain_ids)
+        selected_residues = [res for res in residues if res["chain"] in selected_chain_ids]
+        seq = af2_util.residues_to_sequence(selected_residues)
 
-        elif len(splits) == 1:
-            monomer   = True
-            binderlen = -1
+        if len(seq) != all_atom_positions.shape[0]:
+            raise Exception(
+                f"Residue/atom parsing mismatch for {pdb_path}: "
+                f"sequence length {len(seq)} vs atoms length {all_atom_positions.shape[0]}"
+            )
 
-        elif len(splits) == 2:
-            if self.force_monomer:
-                print( "/" * 60 ) 
-                print( f"Pose {tag} has two chains. But force_monomer is set to True. Treating as monomer.")
-                print( f"I am going to assume that the first chain is the binder and that is the chain I will predict")
-                print( "/" * 60 ) 
+        usetag = self._tag_from_path(pdb_path)
+        struct_data = {
+            "seq": seq,
+            "all_atom_positions": all_atom_positions,
+            "all_atom_masks": all_atom_masks,
+        }
 
-                monomer   = True
-                pose      = splits[1]
-                binderlen = -1
-            else: 
-                monomer   = False
-                binderlen = splits[1].size()
+        if self.debug_print:
+            nonzero_atoms = int(np.sum(all_atom_masks))
+            print(
+                f"[debug_print] tag={usetag} pdb={pdb_path} "
+                f"chain_order={chain_order} selected_chains={sorted(selected_chain_ids)} "
+                f"monomer={monomer} binderlen={binderlen} "
+                f"seq_len={len(seq)} atom_len={all_atom_positions.shape[0]} "
+                f"nonzero_atom_entries={nonzero_atoms}"
+            )
 
-        return pose, monomer, binderlen, usetag
+        return struct_data, monomer, binderlen, usetag
+
 
 ####################
 ####### Main #######
@@ -587,32 +501,34 @@ if device == 'gpu':
     print('Found GPU and will use it to run AF2')
     print('/' * 60)
     print('/' * 60)
-    print('\n')
+    print('\\n')
 else:
     print('/' * 60)
     print('/' * 60)
     print('WARNING! No GPU detected running AF2 on CPU')
     print('/' * 60)
     print('/' * 60)
-    print('\n')
+    print('\\n')
 
 struct_manager = StructManager(args)
-af2_runner     = AF2_runner(args, struct_manager)
+af2_runner = AF2_runner(args, struct_manager)
 
 for pdb in struct_manager.iterate():
 
-    if args.debug: af2_runner.process_struct(pdb)
+    if args.debug:
+        af2_runner.process_struct(pdb)
 
-    else: # When not in debug mode the script will continue to run even when some poses fail
+    else:
         t0 = timer()
 
-        try: af2_runner.process_struct(pdb)
+        try:
+            af2_runner.process_struct(pdb)
 
-        except KeyboardInterrupt: sys.exit( "Script killed by Control+C, exiting" )
+        except KeyboardInterrupt:
+            sys.exit("Script killed by Control+C, exiting")
 
-        except:
+        except Exception:
             seconds = int(timer() - t0)
-            print( "Struct with tag %s failed in %i seconds with error: %s"%( pdb, seconds, sys.exc_info()[0] ) )
+            print("Struct with tag %s failed in %i seconds with error: %s" % (pdb, seconds, sys.exc_info()[0]))
 
-    # We are done with one pdb, record that we finished
     struct_manager.record_checkpoint(pdb)
