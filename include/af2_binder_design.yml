@@ -18,3 +18,5 @@ dependencies:
     - jaxlib
     - dm-haiku
     - dm-tree
+    - pyfaspr
+    - pdbfixer

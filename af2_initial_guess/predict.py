@@ -88,6 +88,18 @@ parser.add_argument("-max_amide_dist", type=float, default=3.0, help='The maximu
 parser.add_argument("-recycle", type=int, default=3, help='The number of AF2 recycles to perform (default: 3)')
 parser.add_argument("-no_initial_guess", action="store_true", default=False, help='When active, the model will not use an initial guess (default: False)')
 parser.add_argument("-force_monomer", action="store_true", default=False, help='When active, predict only the first chain in a two-chain pdb as a monomer (default: False)')
+parser.add_argument(
+    "-use_pdbfixer",
+    action="store_true",
+    default=False,
+    help="Disable PDBFixer atom completion (default: False; completion enabled).",
+)
+parser.add_argument(
+    "-use_pyfaspr",
+    action="store_true",
+    default=False,
+    help="Enable pyfaspr side-chain rotamer optimization in-memory after optional PDBFixer completion.",
+)
 
 args = parser.parse_args()
 
@@ -144,13 +156,7 @@ class AF2_runner():
 
         self.model_runner = model.RunModel(model_config, model_params)
 
-    def featurize(self, feat_holder, pdb_path):
-
-        all_atom_positions, all_atom_masks = af2_util.af2_get_atom_positions(pdb_path)
-
-        feat_holder.initial_all_atom_positions = all_atom_positions
-        feat_holder.initial_all_atom_masks     = all_atom_masks
-        
+    def featurize(self, feat_holder):
         initial_guess = af2_util.parse_initial_guess(feat_holder.initial_all_atom_positions)
 
         # Determine which residues to template
@@ -330,7 +336,7 @@ class AF2_runner():
 
         print(f'Processing struct with tag: {feat_holder.tag}')
 
-        feature_dict, initial_guess = self.featurize(feat_holder, pdb_path)
+        feature_dict, initial_guess = self.featurize(feat_holder)
 
         start = timer()
         print(f'Running {self.model_name}')
@@ -354,6 +360,8 @@ class StructManager():
         self.args = args
 
         self.force_monomer = args.force_monomer
+        self.use_pdbfixer = args.use_pdbfixer
+        self.use_pyfaspr = args.use_pyfaspr
         self.debug_print = args.debug_print
         self.feature_dump_dir = args.feature_dump_dir
         self.score_fn = args.scorefilename
@@ -431,7 +439,19 @@ class StructManager():
             print(f"[debug_print] dumped featurized features to {out_fn}")
 
     def load_pose(self, pdb_path):
-        residues = af2_util.parse_pdb_residues(pdb_path)
+        fixed_missing_atom_count = 0
+        pyfaspr_applied = False
+        if self.use_pdbfixer:
+            pdb_text, fixed_missing_atom_count = af2_util.complete_pdb_backbone_to_all_atom_text(pdb_path)
+        else:
+            with open(pdb_path, "r") as handle:
+                pdb_text = handle.read()
+
+        if self.use_pyfaspr:
+            pdb_text = af2_util.optimize_rotamers_with_pyfaspr(pdb_text)
+            pyfaspr_applied = True
+
+        residues = af2_util.parse_pdb_residues_from_text(pdb_text)
         if len(residues) == 0:
             raise Exception(f'Pose {pdb_path} is empty. This is not supported by this script.')
 
@@ -460,7 +480,7 @@ class StructManager():
         else:
             binderlen = sum(1 for res in residues if res["chain"] == chain_order[0])
 
-        all_atom_positions, all_atom_masks = af2_util.af2_get_atom_positions(pdb_path, selected_chain_ids)
+        all_atom_positions, all_atom_masks = af2_util.af2_get_atom_positions_from_pdb_text(pdb_text, selected_chain_ids)
         selected_residues = [res for res in residues if res["chain"] in selected_chain_ids]
         seq = af2_util.residues_to_sequence(selected_residues)
 
@@ -484,7 +504,9 @@ class StructManager():
                 f"chain_order={chain_order} selected_chains={sorted(selected_chain_ids)} "
                 f"monomer={monomer} binderlen={binderlen} "
                 f"seq_len={len(seq)} atom_len={all_atom_positions.shape[0]} "
-                f"nonzero_atom_entries={nonzero_atoms}"
+                f"nonzero_atom_entries={nonzero_atoms} "
+                f"pdbfixer_enabled={self.use_pdbfixer} pdbfixer_missing_atoms={fixed_missing_atom_count} "
+                f"pyfaspr_enabled={self.use_pyfaspr} pyfaspr_applied={pyfaspr_applied}"
             )
 
         return struct_data, monomer, binderlen, usetag
