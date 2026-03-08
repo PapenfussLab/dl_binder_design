@@ -6,10 +6,12 @@
     GPUs
 '''
 
-# PyRosetta
-from pyrosetta import *
-from rosetta import *
-init()
+# OpenMM + PDBFixer
+from pdbfixer import PDBFixer
+try:
+    from openmm.app import PDBFile
+except ImportError:
+    from simtk.openmm.app import PDBFile
 
 # PyTorch
 import torch

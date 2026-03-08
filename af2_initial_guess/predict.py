@@ -22,6 +22,7 @@ from alphafold.model import config
 from alphafold.model import model
 
 import af2_util
+import common_util
 
 
 def _rewrite_chain_ids(pdb_text, binderlen):
@@ -442,13 +443,13 @@ class StructManager():
         fixed_missing_atom_count = 0
         pyfaspr_applied = False
         if self.use_pdbfixer:
-            pdb_text, fixed_missing_atom_count = af2_util.complete_pdb_backbone_to_all_atom_text(pdb_path)
+            pdb_text, fixed_missing_atom_count = common_util.complete_pdb_backbone_to_all_atom_text(pdb_path)
         else:
             with open(pdb_path, "r") as handle:
                 pdb_text = handle.read()
 
         if self.use_pyfaspr:
-            pdb_text = af2_util.optimize_rotamers_with_pyfaspr(pdb_text)
+            pdb_text = common_util.optimize_rotamers_with_pyfaspr(pdb_text)
             pyfaspr_applied = True
 
         residues = af2_util.parse_pdb_residues_from_text(pdb_text)
