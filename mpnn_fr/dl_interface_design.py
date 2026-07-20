@@ -1,38 +1,110 @@
 #!/usr/bin/env python
 
-import os, sys
-
-from pyrosetta import *
-from pyrosetta.rosetta import *
+import argparse
+import glob
+import io
+import json
+import os
+import re
+import sys
+import tempfile
+import time
 
 import numpy as np
-from collections import OrderedDict
-import time
-import argparse
-import subprocess
-import time
-import glob
-
 import torch
-import json
-
-import util_protein_mpnn as mpnn_util
 
 parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(parent, 'include'))
-from silent_tools import silent_tools
+sys.path.append(os.path.join(parent, 'af2_initial_guess'))
 
-init( "-beta_nov16 -in:file:silent_struct_type binary -mute all" +
-    " -use_terminal_residues true -mute basic.io.database core.scoring" )
+import util_protein_mpnn as mpnn_util
+import common_util
 
-def cmd(command, wait=True):
-    the_command = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-    if (not wait):
-        return
-    the_stuff = the_command.communicate()
-    return str( the_stuff[0]) + str(the_stuff[1] )
 
-def range1( iterable ): return range( 1, iterable + 1 )
+def range1(iterable):
+    return range(1, iterable + 1)
+
+
+def _load_openmm_modules():
+    try:
+        from openmm import CustomExternalForce, LangevinIntegrator, Platform, unit
+        from openmm.app import ForceField, HBonds, NoCutoff, PDBFile, Simulation
+    except ImportError:
+        from simtk import unit
+        from simtk.openmm import CustomExternalForce, LangevinIntegrator, Platform
+        from simtk.openmm.app import ForceField, HBonds, NoCutoff, PDBFile, Simulation
+
+    return {
+        "CustomExternalForce": CustomExternalForce,
+        "LangevinIntegrator": LangevinIntegrator,
+        "Platform": Platform,
+        "unit": unit,
+        "ForceField": ForceField,
+        "HBonds": HBonds,
+        "NoCutoff": NoCutoff,
+        "PDBFile": PDBFile,
+        "Simulation": Simulation,
+    }
+
+
+def _openmm_relax_pdb_text(pdb_text, max_iterations, restraint_k, platform_name):
+    try:
+        from pdbfixer import PDBFixer
+    except ImportError as exc:
+        raise ImportError(
+            "PDBFixer is required for OpenMM relax. Install it (e.g. `conda install -c conda-forge pdbfixer`)."
+        ) from exc
+
+    omm = _load_openmm_modules()
+    unit = omm["unit"]
+
+    try:
+        fixer = PDBFixer(pdbfile=io.StringIO(pdb_text))
+    except TypeError:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as tmp:
+            tmp.write(pdb_text)
+            tmp_path = tmp.name
+        try:
+            fixer = PDBFixer(filename=tmp_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    fixer.findMissingResidues()
+    fixer.findMissingAtoms()
+    fixer.addMissingAtoms()
+    fixer.addMissingHydrogens(7.0)
+
+    ff = omm["ForceField"]("amber14/protein.ff14SB.xml")
+    system = ff.createSystem(fixer.topology, nonbondedMethod=omm["NoCutoff"], constraints=omm["HBonds"])
+
+    if restraint_k > 0:
+        # Convert kcal/mol/A^2 to kJ/mol/nm^2.
+        restraint_k_kj_nm2 = restraint_k * 418.4
+        force = omm["CustomExternalForce"]("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
+        force.addGlobalParameter("k", restraint_k_kj_nm2)
+        force.addPerParticleParameter("x0")
+        force.addPerParticleParameter("y0")
+        force.addPerParticleParameter("z0")
+
+        positions = fixer.positions
+        for idx, atom in enumerate(fixer.topology.atoms()):
+            if atom.name in {"N", "CA", "C", "O"}:
+                pos = positions[idx].value_in_unit(unit.nanometer)
+                force.addParticle(idx, [pos[0], pos[1], pos[2]])
+
+        system.addForce(force)
+
+    integrator = omm["LangevinIntegrator"](0, 0.01, 0.0)
+    platform = omm["Platform"].getPlatformByName(platform_name)
+    simulation = omm["Simulation"](fixer.topology, system, integrator, platform)
+    simulation.context.setPositions(fixer.positions)
+    simulation.minimizeEnergy(maxIterations=max_iterations)
+
+    state = simulation.context.getState(getPositions=True)
+    out_buf = io.StringIO()
+    omm["PDBFile"].writeFile(fixer.topology, state.getPositions(), out_buf, keepIds=True)
+    return out_buf.getvalue()
+
 
 #################################
 # Parse Arguments
@@ -42,85 +114,163 @@ parser = argparse.ArgumentParser()
 script_dir = os.path.dirname(os.path.realpath(__file__))
 
 # I/O Arguments
-parser.add_argument( "-pdbdir", type=str, default="", help='The name of a directory of pdbs to run through the model' )
-parser.add_argument( "-silent", type=str, default="", help='The name of a silent file to run through the model' )
-parser.add_argument( "-outpdbdir", type=str, default="outputs", help='The directory to which the output PDB files will be written, used if the -pdbdir arg is active' )
-parser.add_argument( "-outsilent", type=str, default="out.silent", help='The name of the silent file to which output structs will be written, used if the -silent arg is active' )
-parser.add_argument( "-runlist", type=str, default='', help="The path of a list of pdb tags to run, only active when the -pdbdir arg is active (default: ''; Run all PDBs)" )
-parser.add_argument( "-checkpoint_name", type=str, default='check.point', help="The name of a file where tags which have finished will be written (default: check.point)" )
+parser.add_argument("-pdbdir", type=str, default="", help='The name of a directory of pdbs to run through the model')
+parser.add_argument("-outpdbdir", type=str, default="outputs", help='The directory to which the output PDB files will be written, used if the -pdbdir arg is active')
+parser.add_argument("-runlist", type=str, default='', help="The path of a list of pdb tags to run, only active when the -pdbdir arg is active (default: ''; Run all PDBs)")
+parser.add_argument("-checkpoint_name", type=str, default='check.point', help="The name of a file where tags which have finished will be written (default: check.point)")
 
-parser.add_argument( "-debug", action="store_true", default=False, help='When active, errors will cause the script to crash and the error message to be printed out (default: False)')
+parser.add_argument("-debug", action="store_true", default=False, help='When active, errors will cause the script to crash and the error message to be printed out (default: False)')
 
 # Design Arguments
-parser.add_argument( "-relax_cycles", type=int, default=1, help="The number of relax cycles to perform on each structure (default: 1)" )
-parser.add_argument( "-output_intermediates", action="store_true", help='Whether to write all intermediate sequences from the relax cycles to disk (default: False)' )
-parser.add_argument( "-seqs_per_struct", type=int, default="1", help="The number of sequences to generate for each structure (default: 1)" )
+parser.add_argument("-relax_cycles", type=int, default=1, help="The number of OpenMM relax cycles to perform on each structure (default: 1)")
+parser.add_argument("-output_intermediates", action="store_true", help='Whether to write all intermediate sequences from the relax cycles to disk (default: False)')
+parser.add_argument("-seqs_per_struct", type=int, default=1, help="The number of sequences to generate for each structure (default: 1)")
+parser.add_argument("-relax_max_iterations", type=int, default=200, help="OpenMM minimization max iterations per relax cycle (default: 200)")
+parser.add_argument("-relax_restraint_k", type=float, default=2.0, help="Backbone harmonic restraint strength in kcal/mol/A^2 (default: 2.0)")
+parser.add_argument("-relax_platform", type=str, default="CPU", choices=["CPU", "CUDA", "OpenCL"], help="OpenMM platform to use for minimization (default: CPU)")
 
 # ProteinMPNN-Specific Arguments
-parser.add_argument( "-checkpoint_path", type=str, default=os.path.join(script_dir, 'ProteinMPNN/vanilla_model_weights/v_48_020.pt'), help=f"The path to the ProteinMPNN weights you wish to use, default {os.path.join(script_dir, 'ProteinMPNN/vanilla_model_weights/v_48_020.pt')}")
-parser.add_argument( "-temperature", type=float, default=0.000001, help='The sampling temperature to use when running ProteinMPNN (default: 0.000001)' )
-parser.add_argument( "-augment_eps", type=float, default=0, help='The variance of random noise to add to the atomic coordinates (default 0)' )
-parser.add_argument( "-protein_features", type=str, default='full', help='What type of protein features to input to ProteinMPNN (default: full)' )
-parser.add_argument( "-omit_AAs", type=str, default='CX', help='A string of all residue types (one letter case-insensitive) that you would not like to use for design. Letters not corresponding to residue types will be ignored (default: CX)' )
-parser.add_argument( "-bias_AA_jsonl", type=str, default='', help='The path to a JSON file containing a dictionary mapping residue one-letter names to the bias for that residue eg. {A: -1.1, F: 0.7} (default: ''; no bias)' )
-parser.add_argument( "-num_connections", type=int, default=48, help='Number of neighbors each residue is connected to. Do not mess around with this argument unless you have a specific set of ProteinMPNN weights which expects a different number of connections. (default: 48)' )
+parser.add_argument("-checkpoint_path", type=str, default=os.path.join(script_dir, 'ProteinMPNN/vanilla_model_weights/v_48_020.pt'), help=f"The path to the ProteinMPNN weights you wish to use, default {os.path.join(script_dir, 'ProteinMPNN/vanilla_model_weights/v_48_020.pt')}")
+parser.add_argument("-temperature", type=float, default=0.000001, help='The sampling temperature to use when running ProteinMPNN (default: 0.000001)')
+parser.add_argument("-augment_eps", type=float, default=0, help='The variance of random noise to add to the atomic coordinates (default 0)')
+parser.add_argument("-protein_features", type=str, default='full', help='What type of protein features to input to ProteinMPNN (default: full)')
+parser.add_argument("-omit_AAs", type=str, default='CX', help='A string of all residue types (one letter case-insensitive) that you would not like to use for design. Letters not corresponding to residue types will be ignored (default: CX)')
+parser.add_argument("-bias_AA_jsonl", type=str, default='', help='The path to a JSON file containing a dictionary mapping residue one-letter names to the bias for that residue eg. {A: -1.1, F: 0.7} (default: ''; no bias)')
+parser.add_argument("-num_connections", type=int, default=48, help='Number of neighbors each residue is connected to. Do not mess around with this argument unless you have a specific set of ProteinMPNN weights which expects a different number of connections. (default: 48)')
 
-args = parser.parse_args( sys.argv[1:] )
+args = parser.parse_args(sys.argv[1:])
 
-class sample_features():
-    '''
-    This is a struct which keeps all the features related to a single sample together
-    '''
 
-    def __init__(self, pose, tag):
-        self.pose = pose
+class sample_features:
+    """
+    Struct holding mutable PDB text and parsed sample metadata.
+    """
+
+    BACKBONE_ATOMS = {"N", "CA", "C", "O", "OXT"}
+
+    def __init__(self, pdb_lines, tag):
+        self.pdb_lines = pdb_lines
         self.tag = os.path.basename(tag).split('.')[0]
-    
+        self.chains = self._parse_chain_order()
+
+    def _iter_atom_records(self):
+        for line in self.pdb_lines:
+            if not line.startswith("ATOM"):
+                continue
+            chain = line[21]
+            resseq = line[22:26]
+            icode = line[26]
+            yield line, (chain, resseq, icode)
+
+    def _parse_chain_order(self):
+        chains = []
+        seen = set()
+        for _, (chain, _, _) in self._iter_atom_records():
+            if chain in seen:
+                continue
+            seen.add(chain)
+            chains.append(chain)
+        return chains
+
+    def _chain_residue_keys(self, chain_id):
+        ordered = []
+        seen = set()
+        for _, key in self._iter_atom_records():
+            chain, _, _ = key
+            if chain != chain_id or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+        return ordered
+
     def parse_fixed_res(self):
-        '''
-            Parse which residues are fixed from the residue remarks
-        '''
-
-        # Iterate over the residue positions in this pose and check if they are fixed
+        """
+        Parse fixed residues from Rosetta PDB info labels if present.
+        """
         fixed_list = []
+        fixed_re = re.compile(r"PDBinfo-LABEL:\s*(\d+)\s+FIXED")
+        for line in self.pdb_lines:
+            if "PDBinfo-LABEL" not in line or "FIXED" not in line:
+                continue
+            match = fixed_re.search(line)
+            if match:
+                fixed_list.append(int(match.group(1)))
 
-        endA = self.pose.split_by_chain()[1].total_residue()
-        for resi in range1( endA ):
-            reslabels = self.pose.pdb_info().get_reslabels( resi )
+        fixed_list = sorted(set(fixed_list))
 
-            if len(reslabels) == 0: continue
+        if not self.chains:
+            self.fixed_res = {}
+            return
 
-            if str(self.pose.pdb_info().get_reslabels( resi )[1]).strip() == 'FIXED':
-                fixed_list.append( resi )
+        if len(self.chains) == 1:
+            self.fixed_res = {self.chains[0]: fixed_list}
+            return
 
-        # Get ordered unique chainIDs for the pose
-        # The last chain (B) is the target and will have a fixed sequence
-        self.chains = list( OrderedDict.fromkeys( [ self.pose.pdb_info().chain(i) for i in range1( self.pose.total_residue() ) ] ) )
-
-        # Create the fixed res dict, this will be input to ProteinMPNN
         self.fixed_res = {
             self.chains[0]: fixed_list,
-            self.chains[1]: []
+            self.chains[1]: [],
         }
-    
+
     def thread_mpnn_seq(self, binder_seq):
-        '''
-        Thread the binder sequence onto the pose being designed
-        '''
-        rsd_set = self.pose.residue_type_set_for_pose( core.chemical.FULL_ATOM_t )
+        """
+        Thread sequence onto chain 0 by residue renaming and sidechain stripping.
+        Sidechains are rebuilt before OpenMM minimization with PDBFixer.
+        """
+        if not self.chains:
+            raise ValueError("No ATOM records found in input PDB")
 
-        for resi, mut_to in enumerate( binder_seq ):
-            resi += 1 # 1 indexing
-            name3 = mpnn_util.aa_1_3[ mut_to ]
-            new_res = core.conformation.ResidueFactory.create_residue( rsd_set.name_map( name3 ) )
-            self.pose.replace_residue( resi, new_res, True )
-    
+        target_chain = self.chains[0]
+        chain_keys = self._chain_residue_keys(target_chain)
 
-class ProteinMPNN_runner():
-    '''
-    This class is designed to run the ProteinMPNN model on a single input. This class handles
-    the loading of the model, the loading of the input data, the FastRelax cycles, and the processing of the output
-    '''
+        if len(chain_keys) != len(binder_seq):
+            raise ValueError(
+                f"Threading length mismatch for chain {target_chain}: "
+                f"expected {len(chain_keys)} residues, got sequence of {len(binder_seq)}"
+            )
+
+        seq_map = {}
+        for key, aa in zip(chain_keys, binder_seq):
+            if aa not in mpnn_util.aa_1_3:
+                raise ValueError(f"Unsupported residue in MPNN sequence: {aa}")
+            seq_map[key] = mpnn_util.aa_1_3[aa]
+
+        new_lines = []
+        for line in self.pdb_lines:
+            if not line.startswith("ATOM"):
+                new_lines.append(line)
+                continue
+
+            atom_name = line[12:16].strip()
+            key = (line[21], line[22:26], line[26])
+            if key not in seq_map:
+                new_lines.append(line)
+                continue
+
+            # Drop original sidechain atoms for mutated residues.
+            if atom_name not in self.BACKBONE_ATOMS:
+                continue
+
+            new_resname = seq_map[key]
+            new_line = f"{line[:17]}{new_resname}{line[20:]}"
+            new_lines.append(new_line)
+
+        self.pdb_lines = new_lines
+
+    def relax_with_openmm(self, max_iterations, restraint_k, platform_name):
+        pdb_text = ''.join(self.pdb_lines)
+        relaxed_text = _openmm_relax_pdb_text(
+            pdb_text,
+            max_iterations=max_iterations,
+            restraint_k=restraint_k,
+            platform_name=platform_name,
+        )
+        self.pdb_lines = [f"{line}\n" for line in relaxed_text.splitlines()]
+
+
+class ProteinMPNN_runner:
+    """
+    Runs ProteinMPNN and optional OpenMM relaxation on one input structure.
+    """
 
     def __init__(self, args, struct_manager):
         self.struct_manager = struct_manager
@@ -135,10 +285,10 @@ class ProteinMPNN_runner():
         self.mpnn_model = mpnn_util.init_seq_optimize_model(
             self.device,
             hidden_dim=128,
-            num_layers = 3,
-            backbone_noise = args.augment_eps,
-            num_connections = args.num_connections,
-            checkpoint_path = args.checkpoint_path
+            num_layers=3,
+            backbone_noise=args.augment_eps,
+            num_connections=args.num_connections,
+            checkpoint_path=args.checkpoint_path,
         )
 
         alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
@@ -147,9 +297,8 @@ class ProteinMPNN_runner():
 
         self.temperature = args.temperature
         self.seqs_per_struct = args.seqs_per_struct
-        self.omit_AAs = [ letter for letter in args.omit_AAs.upper() if letter in list(alphabet) ]
+        self.omit_AAs = [letter for letter in args.omit_AAs.upper() if letter in list(alphabet)]
 
-        # Parse AA bias settings from json
         if os.path.isfile(args.bias_AA_jsonl):
             print(f'Found AA bias json file at {args.bias_AA_jsonl}')
             with open(args.bias_AA_jsonl, 'r') as json_file:
@@ -162,48 +311,55 @@ class ProteinMPNN_runner():
                 if AA in list(bias_AA_dict.keys()):
                     self.bias_AAs_np[n] = bias_AA_dict[AA]
         else:
-            # Not using AA bias
             self.bias_AAs_np = np.zeros(len(alphabet))
 
-        # Configs for the FastRelax cycles
-        xml = os.path.join(script_dir, 'RosettaFastRelaxUtil.xml')
-        objs = protocols.rosetta_scripts.XmlObjects.create_from_file(xml)
-
-        self.FastRelax = objs.get_mover('FastRelax')
-
         self.relax_cycles = args.relax_cycles
+        self.relax_max_iterations = args.relax_max_iterations
+        self.relax_restraint_k = args.relax_restraint_k
+        self.relax_platform = args.relax_platform
+
+    def rebuild_sidechains(self, sample_feats):
+        """
+        Rebuild missing heavy sidechain atoms from in-memory PDB text.
+        """
+        pdb_text, _ = common_util.complete_pdb_backbone_to_all_atom_text_from_text(''.join(sample_feats.pdb_lines))
+        pdb_text = common_util.optimize_rotamers_with_pyfaspr(pdb_text)
+        sample_feats.pdb_lines = [f"{line}\n" for line in pdb_text.splitlines()]
+        sample_feats.chains = sample_feats._parse_chain_order()
 
     def relax_pose(self, sample_feats):
-        '''
-        Run FastRelax on the current pose
-        '''
-
-        relaxT0 = time.time()
-
-        print('Running FastRelax')
-
-        self.FastRelax.apply(sample_feats.pose)
-
-        print(f"Completed one cycle of FastRelax in {int(time.time()) - relaxT0} seconds")
+        """
+        Run one OpenMM restrained minimization cycle on the current structure.
+        """
+        relax_t0 = time.time()
+        print('Running OpenMM minimization')
+        sample_feats.relax_with_openmm(
+            max_iterations=self.relax_max_iterations,
+            restraint_k=self.relax_restraint_k,
+            platform_name=self.relax_platform,
+        )
+        print(f"Completed one cycle of OpenMM minimization in {int(time.time() - relax_t0)} seconds")
 
     def sequence_optimize(self, sample_feats):
         mpnn_t0 = time.time()
 
-        # Once we have figured out pose I/O without Rosetta this will be easy to swap in
-        pdbfile = 'temp.pdb'
-        sample_feats.pose.dump_pdb(pdbfile)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as tmp:
+            tmp.writelines(sample_feats.pdb_lines)
+            pdbfile = tmp.name
 
-        feature_dict = mpnn_util.generate_seqopt_features(pdbfile, sample_feats.chains)
+        try:
+            feature_dict = mpnn_util.generate_seqopt_features(pdbfile, sample_feats.chains)
+        finally:
+            if os.path.exists(pdbfile):
+                os.remove(pdbfile)
 
-        os.remove(pdbfile)
-
-        arg_dict = mpnn_util.set_default_args( self.seqs_per_struct, omit_AAs=self.omit_AAs )
+        arg_dict = mpnn_util.set_default_args(self.seqs_per_struct, omit_AAs=self.omit_AAs)
         arg_dict['temperature'] = self.temperature
 
-        masked_chains  = sample_feats.chains[:-1]
+        masked_chains = sample_feats.chains[:-1]
         visible_chains = [sample_feats.chains[-1]]
 
-        fixed_positions_dict = {pdbfile[:-len('.pdb')]: sample_feats.fixed_res}
+        fixed_positions_dict = {feature_dict['name']: sample_feats.fixed_res}
 
         if self.debug:
             print(f'Fixed positions dict: {fixed_positions_dict}')
@@ -216,137 +372,104 @@ class ProteinMPNN_runner():
             masked_chains,
             visible_chains,
             bias_AAs_np=self.bias_AAs_np,
-            fixed_positions_dict=fixed_positions_dict
+            fixed_positions_dict=fixed_positions_dict,
         )
-        
-        if self.debug:
-            print(f'Generated sequence(s): {sequences}') 
 
-        print( f"ProteinMPNN generated {len(sequences)} sequences in {int( time.time() - mpnn_t0 )} seconds" ) 
+        if self.debug:
+            print(f'Generated sequence(s): {sequences}')
+
+        print(f"ProteinMPNN generated {len(sequences)} sequences in {int(time.time() - mpnn_t0)} seconds")
 
         return sequences
 
     def proteinmpnn(self, sample_feats):
-        '''
-        Run ProteinMPNN sequence optimization on the pose, this does not use FastRelax
-        '''
+        """
+        Run ProteinMPNN sequence optimization only (no relaxation cycles).
+        """
         seqs_scores = self.sequence_optimize(sample_feats)
 
-        # Iterate though each seq score pair and thread the sequence onto the pose
-        # Then write each pose to a pdb file
         prefix = f"{sample_feats.tag}_dldesign"
-        for idx, (seq, score) in enumerate(seqs_scores): 
+        for idx, (seq, _) in enumerate(seqs_scores):
             sample_feats.thread_mpnn_seq(seq)
-
+            self.rebuild_sidechains(sample_feats)
+            # May need relax for initial guess - but maybe rebuild and optimise with faspr is enough
+            self.relax_pose(sample_feats)
             outtag = f"{prefix}_{idx}"
-
-            self.struct_manager.dump_pose(sample_feats.pose, outtag)
+            self.struct_manager.dump_pose(sample_feats.pdb_lines, outtag)
 
     def proteinmpnn_fastrelax(self, sample_feats):
-        '''
-        Run ProteinMPNN plus FastRelax on the pose being designed
-        '''
-        tot_t0 = time.time()
-        design_counter = 0
-
+        """
+        Run ProteinMPNN plus OpenMM relaxation cycles.
+        """
         prefix = f"{sample_feats.tag}_dldesign"
 
         for cycle in range(args.relax_cycles):
-
             seqs_scores = self.sequence_optimize(sample_feats)
-
-            seq, mpnn_score = seqs_scores[0] # We know there is only one entry
+            seq, _ = seqs_scores[0]
             sample_feats.thread_mpnn_seq(seq)
-
+            self.rebuild_sidechains(sample_feats)
             self.relax_pose(sample_feats)
 
             if args.output_intermediates:
                 tag = f"{prefix}_0_cycle{cycle}"
-                self.struct_manager.dump_pose(sample_feats.pose, tag)
+                self.struct_manager.dump_pose(sample_feats.pdb_lines, tag)
 
         seqs_scores = self.sequence_optimize(sample_feats)
-
-        seq, mpnn_score = seqs_scores[0] # We know there is only one entry
+        seq, _ = seqs_scores[0]
         sample_feats.thread_mpnn_seq(seq)
+        self.rebuild_sidechains(sample_feats)
+        self.relax_pose(sample_feats) # I added this final relax to try to avoid clashes which may impact initial guess
 
         tag = f"{prefix}_0_cycle{args.relax_cycles}"
-        self.struct_manager.dump_pose(sample_feats.pose, tag)
+        self.struct_manager.dump_pose(sample_feats.pdb_lines, tag)
 
     def run_model(self, tag, args):
         t0 = time.time()
 
         print(f"Attempting pose: {tag}")
-        
-        # Load the pose 
-        pose = self.struct_manager.load_pose(tag)
 
-        # Initialize the features
-        sample_feats = sample_features(pose, tag)
-
-        # Parse the fixed residues from the pose remarks
+        pdb_lines = self.struct_manager.load_pose(tag)
+        sample_feats = sample_features(pdb_lines, tag)
         sample_feats.parse_fixed_res()
 
-        # Now determine which type of run we are doing and execute it
         if args.relax_cycles > 0:
             if args.seqs_per_struct > 1:
                 raise Exception('Cannot use --seqs_per_struct > 1 with --relax_cycles > 0')
 
             self.proteinmpnn_fastrelax(sample_feats)
-
         else:
             self.proteinmpnn(sample_feats)
 
         seconds = int(time.time() - t0)
+        print(f"Struct: {tag} reported success in {seconds} seconds")
 
-        print( f"Struct: {pdb} reported success in {seconds} seconds" )
 
-class StructManager():
-    '''
-    This class handles all of the input and output for the ProteinMPNN model. It deals with silent files vs. pdbs,
-    checkpointing, and writing of outputs
-
-    Note: This class could be moved to a separate file
-    '''
+class StructManager:
+    """
+    Handles input/output and checkpointing for PDB workflows.
+    """
 
     def __init__(self, args):
         self.args = args
 
-        self.silent = False
-        if not args.silent == '':
-            self.silent = True
+        self.pdb = bool(args.pdbdir)
+        if not self.pdb:
+            raise ValueError("Only -pdbdir input is supported in this OpenMM-only script.")
 
-            self.struct_iterator = silent_tools.get_silent_index(args.silent)['tags']
+        self.pdbdir = args.pdbdir
+        self.outpdbdir = args.outpdbdir
 
-            self.sfd_in = rosetta.core.io.silent.SilentFileData(rosetta.core.io.silent.SilentFileOptions())
-            self.sfd_in.read_file(args.silent)
+        self.struct_iterator = glob.glob(os.path.join(args.pdbdir, '*.pdb'))
 
-            self.sfd_out = core.io.silent.SilentFileData(args.outsilent, False, False, "binary", core.io.silent.SilentFileOptions())
+        if args.runlist:
+            with open(args.runlist, 'r') as f:
+                self.runlist = set([line.strip() for line in f])
+            self.struct_iterator = [
+                struct for struct in self.struct_iterator
+                if os.path.basename(struct).split('.')[0] in self.runlist
+            ]
+            print(f'After filtering by runlist, {len(self.struct_iterator)} structures remain')
 
-            self.outsilent = args.outsilent
-
-        self.pdb = False
-        if not args.pdbdir == '':
-            self.pdb = True
-
-            self.pdbdir    = args.pdbdir
-            self.outpdbdir = args.outpdbdir
-
-            self.struct_iterator = glob.glob(os.path.join(args.pdbdir, '*.pdb'))
-
-            # Parse the runlist and determine which structures to process
-            if args.runlist != '':
-                with open(args.runlist, 'r') as f:
-                    self.runlist = set([line.strip() for line in f])
-
-                    # Filter the struct iterator to only include those in the runlist
-                    self.struct_iterator = [struct for struct in self.struct_iterator if os.path.basename(struct).split('.')[0] in self.runlist]
-
-                    print(f'After filtering by runlist, {len(self.struct_iterator)} structures remain')
-
-        # Assert that either silent or pdb is true, but not both
-        assert(self.silent ^ self.pdb), f'Both silent and pdb are set to {args.silent} and {args.pdb} respectively. Only one of these may be active at a time'
-
-        # Setup checkpointing
         self.chkfn = args.checkpoint_name
         self.finished_structs = set()
 
@@ -356,90 +479,49 @@ class StructManager():
                     self.finished_structs.add(line.strip())
 
     def record_checkpoint(self, tag):
-        '''
-        Record the fact that this tag has been processed.
-        Write this tag to the list of finished structs
-        '''
         with open(self.chkfn, 'a') as f:
             f.write(f'{tag}\n')
 
     def iterate(self):
-        '''
-        Iterate over the silent file or pdb directory and run the model on each structure
-        '''
-
-        # Iterate over the structs and for each, check that the struct has not already been processed
         for struct in self.struct_iterator:
             tag = os.path.basename(struct).split('.')[0]
             if tag in self.finished_structs:
                 print(f'{tag} has already been processed. Skipping')
                 continue
-
             yield struct
 
-    def dump_pose(self, pose, tag):
-        '''
-        Dump this pose to either a silent file or a pdb file depending on the input arguments
-        '''
-        if self.pdb:
-            # If the outpdbdir does not exist, create it
-            # If there are parents in the path that do not exist, create them as well
-            if not os.path.exists(self.outpdbdir):
-                os.makedirs(self.outpdbdir)
+    def dump_pose(self, pdb_lines, tag):
+        if not os.path.exists(self.outpdbdir):
+            os.makedirs(self.outpdbdir)
 
-            pdbfile = os.path.join(self.outpdbdir, tag + '.pdb')
-            pose.dump_pdb(pdbfile)
-        
-        if self.silent:
-            struct = self.sfd_out.create_SilentStructOP()
-            struct.fill_struct(pose, tag)
-
-            self.sfd_out.add_structure(struct)
-            self.sfd_out.write_silent_struct(struct, self.outsilent)
+        pdbfile = os.path.join(self.outpdbdir, tag + '.pdb')
+        with open(pdbfile, 'w') as f:
+            f.writelines(pdb_lines)
 
     def load_pose(self, tag):
-        '''
-        Load a pose from either a silent file or a pdb file depending on the input arguments
-        '''
-
-        if not self.pdb and not self.silent:
-            raise Exception('Neither pdb nor silent is set to True. Cannot load pose')
-
-        if self.pdb:
-            pose = pose_from_pdb(tag)
-        
-        if self.silent:
-            pose = Pose()
-            self.sfd_in.get_structure(tag).fill_pose(pose)
-        
-        return pose
+        with open(tag, 'r') as f:
+            return f.readlines()
 
 
 ####################
 ####### Main #######
 ####################
 
-struct_manager     = StructManager(args)
+struct_manager = StructManager(args)
 proteinmpnn_runner = ProteinMPNN_runner(args, struct_manager)
 
 for pdb in struct_manager.iterate():
-
-    if args.debug: proteinmpnn_runner.run_model(pdb, args)
-
-    else: # When not in debug mode the script will continue to run even when some poses fail
+    if args.debug:
+        proteinmpnn_runner.run_model(pdb, args)
+    else:
         t0 = time.time()
 
-        try: proteinmpnn_runner.run_model(pdb, args)
-
-        except KeyboardInterrupt: sys.exit( "Script killed by Control+C, exiting" )
-
-        except:
+        try:
+            proteinmpnn_runner.run_model(pdb, args)
+        except KeyboardInterrupt:
+            sys.exit("Script killed by Control+C, exiting")
+        except Exception:
             seconds = int(time.time() - t0)
-            print( "Struct with tag %s failed in %i seconds with error: %s"%( pdb, seconds, sys.exc_info()[0] ) )
+            print("Struct with tag %s failed in %i seconds with error: %s" % (pdb, seconds, sys.exc_info()[0]))
 
-    # We are done with one pdb, record that we finished
-    struct_manager.record_checkpoint(pdb)
-    
-
-
-
+    struct_manager.record_checkpoint(os.path.basename(pdb).split('.')[0])

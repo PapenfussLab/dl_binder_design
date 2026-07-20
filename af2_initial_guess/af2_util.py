@@ -1,46 +1,86 @@
 #!/usr/bin/env python3
 
 import numpy as np
-from typing import Tuple
-import collections
+from typing import Tuple, Optional, Set, List, Dict
 from collections import OrderedDict
-import os
+import io
 
 from alphafold.common import residue_constants
 
 import jax.numpy as jnp
+from Bio.PDB import PDBParser
+from Bio.PDB.Polypeptide import is_aa
 
-from pyrosetta import *
-from rosetta import *
-# I don't think we need to call init() here but I'm not sure
+
+def parse_pdb_residues(pdb_fn: str, chain_ids: Optional[Set[str]] = None) -> List[Dict]:
+    """
+    Parse CA-bearing protein residues from a PDB file using Biopython.
+
+    Args:
+        pdb_fn (str): Path to a pdb file.
+        chain_ids (set[str] | None): Optional chain-id filter.
+    """
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("input", pdb_fn)
+    return _parse_structure_residues(structure, chain_ids)
+
+
+def parse_pdb_residues_from_text(pdb_text: str, chain_ids: Optional[Set[str]] = None) -> List[Dict]:
+    """Parse CA-bearing protein residues from PDB text using Biopython."""
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("input", io.StringIO(pdb_text))
+    return _parse_structure_residues(structure, chain_ids)
+
+
+def _parse_structure_residues(structure, chain_ids: Optional[Set[str]] = None) -> List[Dict]:
+    """Shared residue parser from a Biopython Structure object."""
+    residues = []
+
+    for model in structure:
+        for chain in model:
+            if chain_ids is not None and chain.id not in chain_ids:
+                continue
+
+            for residue in chain:
+                _, resseq, icode = residue.id
+                if not is_aa(residue, standard=False):
+                    continue
+                if "CA" not in residue:
+                    continue
+
+                residues.append(
+                    {
+                        "chain": chain.id,
+                        "resname": residue.resname.strip(),
+                        "id": (chain.id, int(resseq), icode if icode else " "),
+                        "residue": residue,
+                    }
+                )
+
+        # Keep behavior consistent with single-model pdbs.
+        break
+
+    return residues
+
+
+def residues_to_sequence(residues: List[Dict]) -> str:
+    """Convert parsed residue records to a one-letter sequence string."""
+    to1letter = {
+        "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+        "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+        "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+        "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+        "MSE": "M",
+    }
+    return "".join(to1letter.get(r["resname"], "X") for r in residues)
 
 def get_seq_from_pdb( pdb_fn ) -> str:
     '''
     Given a pdb file, return the sequence of the protein as a string.
     '''
 
-    to1letter = {
-    "ALA":'A', "ARG":'R', "ASN":'N', "ASP":'D', "CYS":'C',
-    "GLN":'Q', "GLU":'E', "GLY":'G', "HIS":'H', "ILE":'I',
-    "LEU":'L', "LYS":'K', "MET":'M', "PHE":'F', "PRO":'P',
-    "SER":'S', "THR":'T', "TRP":'W', "TYR":'Y', "VAL":'V' }
-
-    seq = []
-    seqstr = ''
-    with open(pdb_fn) as fp:
-        for line in fp:
-            if line.startswith("TER"):
-                seq.append(seqstr)
-                seqstr = ''
-            if not line.startswith("ATOM"):
-                continue
-            if line[12:16].strip() != "CA":
-                continue
-            resName = line[17:20]
-            
-            seqstr += to1letter[resName]
-
-    return seq
+    residues = parse_pdb_residues(pdb_fn)
+    return residues_to_sequence(residues)
 
 def generate_template_features(
                                 seq: str,
@@ -116,59 +156,52 @@ def parse_initial_guess(all_atom_positions) -> jnp.ndarray:
 
     return jnp.array(templates_all_atom_positions)
 
-def af2_get_atom_positions(pose, tmp_fn) -> Tuple[np.ndarray, np.ndarray]:
-    '''
-    Given a pose, return the AF2 atom positions array and atom mask array for the protein.
-    '''
+def _af2_get_atom_positions_from_residues(residues: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+    """Build AF2 atom positions/masks from parsed residue records."""
+    num_res = len(residues)
+    all_positions = np.zeros([num_res, residue_constants.atom_type_num, 3], dtype=np.float32)
+    all_positions_mask = np.zeros([num_res, residue_constants.atom_type_num], dtype=np.int64)
 
-    # write pose to pdb file
-    pose.dump_pdb(tmp_fn)
-
-    with open(tmp_fn, 'r') as pdb_file:
-        lines = pdb_file.readlines()
-
-    # Delete the temporary file
-    os.remove(tmp_fn)
-
-    # indices of residues observed in the structure
-    idx_s = [int(l[22:26]) for l in lines if l[:4]=="ATOM" and l[12:16].strip()=="CA"]
-    num_res = len(idx_s)
-
-    all_positions = np.zeros([num_res, residue_constants.atom_type_num, 3])
-    all_positions_mask = np.zeros([num_res, residue_constants.atom_type_num],
-                                dtype=np.int64)
-
-    residues = collections.defaultdict(list)
-    # 4 BB + up to 10 SC atoms
-    xyz = np.full((len(idx_s), 14, 3), np.nan, dtype=np.float32)
-    for l in lines:
-        if l[:4] != "ATOM":
-            continue
-        resNo, atom, aa = int(l[22:26]), l[12:16], l[17:20]
-
-        residues[ resNo ].append( ( atom.strip(), aa, [float(l[30:38]), float(l[38:46]), float(l[46:54])] ) )
-
-    for resNo in residues:
-
+    for idx, residue_data in enumerate(residues):
         pos = np.zeros([residue_constants.atom_type_num, 3], dtype=np.float32)
         mask = np.zeros([residue_constants.atom_type_num], dtype=np.float32)
+        residue = residue_data["residue"]
+        resname = residue_data["resname"]
 
-        for atom in residues[ resNo ]:
-            atom_name = atom[0]
-            x, y, z = atom[2]
-            if atom_name in residue_constants.atom_order.keys():
+        for atom in residue:
+            atom_name = atom.name.strip()
+            x, y, z = atom.coord
+            if atom_name in residue_constants.atom_order:
                 pos[residue_constants.atom_order[atom_name]] = [x, y, z]
                 mask[residue_constants.atom_order[atom_name]] = 1.0
-            elif atom_name.upper() == 'SE' and res.get_resname() == 'MSE':
-                # Put the coordinates of the selenium atom in the sulphur column.
+            elif atom_name.upper() == 'SE' and resname == 'MSE':
+                # Put selenium coordinates in sulfur column for selenomethionine.
                 pos[residue_constants.atom_order['SD']] = [x, y, z]
                 mask[residue_constants.atom_order['SD']] = 1.0
 
-        idx = idx_s.index(resNo) # This is the order they show up in the pdb
         all_positions[idx] = pos
         all_positions_mask[idx] = mask
 
     return all_positions, all_positions_mask
+
+
+def af2_get_atom_positions(pdb_fn: str, chain_ids: Optional[Set[str]] = None) -> Tuple[np.ndarray, np.ndarray]:
+    '''
+    Given a pdb filename, return the AF2 atom positions array and atom mask array.
+
+    Args:
+        pdb_fn (str): Path to a pdb file.
+        chain_ids (set[str] | None): If provided, only parse these chain IDs.
+    '''
+    residues = parse_pdb_residues(pdb_fn, chain_ids)
+    return _af2_get_atom_positions_from_residues(residues)
+
+
+def af2_get_atom_positions_from_pdb_text(pdb_text: str, chain_ids: Optional[Set[str]] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Given PDB text, return AF2 atom positions and atom masks."""
+    residues = parse_pdb_residues_from_text(pdb_text, chain_ids)
+    return _af2_get_atom_positions_from_residues(residues)
+
 
 def insert_truncations(residue_index, Ls) -> np.ndarray:
     '''
@@ -239,32 +272,6 @@ def add2scorefile(tag, scorefilename, write_header=False, score_dict=None, strin
 
         scores_string = " ".join(final_dict.values())
         f.write("SCORE:     %s        %s\n"%(scores_string, tag))
-
-def insert_Rosetta_chainbreaks( pose, binderlen ) -> core.pose.Pose:
-    '''
-    Given a pose and a list of indices to insert chainbreaks after,
-    insert the chainbreaks into the pose.
-
-    Args:
-        pose (Pose)      : The pose to insert chainbreaks into.
-
-        binderlen (list) : The length of the binder chain
-    '''
-
-    conf = pose.conformation()
-    conf.insert_chain_ending( binderlen )
-
-    pose.set_new_conformation( conf )
-
-    splits = pose.split_by_chain()
-    newpose = splits[1]
-    for i in range( 2, len( splits )+1 ):
-        newpose.append_pose_by_jump( splits[i], newpose.size() )
- 
-    info = core.pose.PDBInfo( newpose, True )
-    newpose.pdb_info( info )
-
-    return newpose
 
 def check_residue_distances(all_positions, all_positions_mask, max_amide_distance) -> list:
     '''
@@ -409,4 +416,3 @@ def calculate_rmsds(
     )
 
     return rmsds
-
