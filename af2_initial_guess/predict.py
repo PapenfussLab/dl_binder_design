@@ -15,7 +15,6 @@ from jax.lib import xla_bridge
 
 from alphafold.common import residue_constants
 from alphafold.common import protein
-from alphafold.common import confidence
 from alphafold.data import pipeline
 from alphafold.model import data
 from alphafold.model import config
@@ -113,6 +112,7 @@ class FeatureHolder():
         self.outtag = self.tag + '_af2pred'
 
         self.seq = struct_data["seq"]
+        self.asym_id = struct_data["asym_id"]
         self.binderlen = binderlen
         self.monomer = monomer
 
@@ -264,6 +264,7 @@ class AF2_runner():
             pae_interaction = (pae_interaction1 + pae_interaction2) / 2
 
             score_dict = {
+                "iptm": confidences["iptm"],
                 "plddt_overall": plddt_overall,
                 "plddt_binder": plddt_binder,
                 "plddt_target": plddt_target,
@@ -288,14 +289,11 @@ class AF2_runner():
 
         structure_module = prediction_result['structure_module']
 
-        confidences = {}
+        confidences = dict(model.get_confidence_metrics(
+            prediction_result,
+            asym_id=None if feat_holder.monomer else feat_holder.asym_id,
+        ))
         confidences['distogram'] = prediction_result['distogram']
-        confidences['plddt'] = confidence.compute_plddt(
-            prediction_result['predicted_lddt']['logits'][...])
-        if 'predicted_aligned_error' in prediction_result:
-            confidences.update(confidence.compute_predicted_aligned_error(
-                prediction_result['predicted_aligned_error']['logits'][...],
-                prediction_result['predicted_aligned_error']['breaks'][...]))
 
         feat_holder.plddt_array = confidences['plddt']
 
@@ -494,6 +492,7 @@ class StructManager():
         usetag = self._tag_from_path(pdb_path)
         struct_data = {
             "seq": seq,
+            "asym_id": np.asarray([res["chain"] for res in selected_residues]),
             "all_atom_positions": all_atom_positions,
             "all_atom_masks": all_atom_masks,
         }

@@ -29,7 +29,8 @@ from alphafold.model import modules
 
 
 def get_confidence_metrics(
-    prediction_result: Mapping[str, Any]) -> Mapping[str, Any]:
+    prediction_result: Mapping[str, Any],
+    asym_id: Optional[np.ndarray] = None) -> Mapping[str, Any]:
   """Post processes prediction_result to get confidence metrics."""
 
   confidence_metrics = {}
@@ -42,6 +43,12 @@ def get_confidence_metrics(
     confidence_metrics['ptm'] = confidence.predicted_tm_score(
         prediction_result['predicted_aligned_error']['logits'],
         prediction_result['predicted_aligned_error']['breaks'])
+    if asym_id is not None:
+      confidence_metrics['iptm'] = confidence.predicted_tm_score(
+          prediction_result['predicted_aligned_error']['logits'],
+          prediction_result['predicted_aligned_error']['breaks'],
+          asym_id=asym_id,
+          interface=True)
 
   return confidence_metrics
 
@@ -119,12 +126,15 @@ class RunModel:
     logging.info('Output shape was %s', shape)
     return shape
 
-  def predict(self, feat: features.FeatureDict, initial_guess=None) -> Mapping[str, Any]:
+  def predict(self, feat: features.FeatureDict, initial_guess=None,
+              asym_id: Optional[np.ndarray] = None) -> Mapping[str, Any]:
     """Makes a prediction by inferencing the model on the provided features.
 
     Args:
       feat: A dictionary of NumPy feature arrays as output by
         RunModel.process_features.
+      initial_guess: Optional initial atom positions.
+      asym_id: Optional per-residue chain IDs used to compute ipTM.
 
     Returns:
       A dictionary of model outputs.
@@ -137,8 +147,7 @@ class RunModel:
     # already happening when computing get_confidence_metrics, and this ensures
     # all outputs are blocked on.
     jax.tree_map(lambda x: x.block_until_ready(), result)
-    result.update(get_confidence_metrics(result))
+    result.update(get_confidence_metrics(result, asym_id=asym_id))
     logging.info('Output shape was %s',
                  tree.map_structure(lambda x: x.shape, result))
     return result
-
