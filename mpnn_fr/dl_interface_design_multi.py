@@ -23,8 +23,15 @@ parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(parent, 'include'))
 from silent_tools import silent_tools
 
+# -detect_disulf false: Rosetta bonds any two cysteines whose SG atoms are close enough when a
+# structure is read, including one in the binder and one in the target. thread_mpnn_seq then
+# calls replace_residue with a plain CYS that carries no disulfide connection, while the
+# Conformation still holds the bond, and dump_pdb exits on the atom index the connection
+# refers to. A designed binder is not covalently bonded to its target, so the detection is
+# turned off rather than repaired after the fact.
 init( "-beta_nov16 -in:file:silent_struct_type binary -mute all" +
-    " -use_terminal_residues true -mute basic.io.database core.scoring" )
+    " -use_terminal_residues true -mute basic.io.database core.scoring" +
+    " -detect_disulf false" )
 
 def cmd(command, wait=True):
     the_command = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
